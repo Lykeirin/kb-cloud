@@ -1,0 +1,92 @@
+services:
+  # ============================================================
+  # PostgreSQL 17 + pgvector
+  # ============================================================
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: kb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kb_admin
+      POSTGRES_PASSWORD: ${KB_DB_PASSWORD}
+      POSTGRES_DB: knowledge_base
+    ports:
+      - "127.0.0.1:5433:5432"   # 仅本地回环，不对外暴露
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kb_admin -d knowledge_base"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c shared_preload_libraries=vector
+      -c max_connections=50
+      -c shared_buffers=512MB
+
+  # ============================================================
+  # MCP Server — SSE/HTTP 模式，REST API + 网页上传界面
+  # ============================================================
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    image: kb-mcp-server:latest
+    container_name: kb-mcp-server
+    restart: unless-stopped
+    environment:
+      KB_DB_HOST: postgres
+      KB_DB_PORT: "5432"
+      KB_DB_NAME: knowledge_base
+      KB_DB_USER: kb_admin
+      KB_DB_PASSWORD: ${KB_DB_PASSWORD}
+      KB_MCP_PORT: "8765"
+      KB_INBOX_DIR: /root/kb-inbox
+    ports:
+      - "127.0.0.1:8765:8765"   # 仅本地回环，通过 SSH 隧道或反向代理访问
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - hf_cache:/root/.cache/huggingface   # 持久化模型缓存
+      - ./server_http.py:/app/server_http.py:ro
+      - ./kb_core.py:/app/kb_core.py:ro
+      - ./embedder.py:/app/embedder.py:ro
+      - ./pdf_extractor.py:/app/pdf_extractor.py:ro
+      - ${KB_INBOX_DIR:-/root/kb-inbox}:/root/kb-inbox        # 上传 API 写入目录
+
+  # ============================================================
+  # Watcher — 文件监控守护进程
+  # 监控 inbox 目录，新文件自动解析+向量化+入库
+  # ============================================================
+  watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.watcher
+    container_name: kb-watcher
+    restart: unless-stopped
+    environment:
+      KB_DB_HOST: postgres
+      KB_DB_PORT: "5432"
+      KB_DB_NAME: knowledge_base
+      KB_DB_USER: kb_admin
+      KB_DB_PASSWORD: ${KB_DB_PASSWORD}
+      KB_INBOX_DIR: /root/kb-inbox
+      KB_ARCHIVE_DIR: /root/kb-archive
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - hf_cache:/root/.cache/huggingface       # 共享模型缓存
+      - ./kb_watcher.py:/app/kb_watcher.py:ro
+      - ./pdf_extractor.py:/app/pdf_extractor.py:ro
+      - ./kb_core.py:/app/kb_core.py:ro
+      - ./embedder.py:/app/embedder.py:ro
+      - ${KB_INBOX_DIR:-/root/kb-inbox}:/root/kb-inbox          # 监控目录（宿主机）
+      - ${KB_ARCHIVE_DIR:-/root/kb-archive}:/root/kb-archive    # 归档目录（宿主机）
+
+volumes:
+  pgdata:
+  hf_cache:

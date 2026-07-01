@@ -1,0 +1,23 @@
+FROM kb-mcp-server:latest
+
+# tesseract OCR 引擎 + 中文语言包
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-chi-sim \
+    && rm -rf /var/lib/apt/lists/*
+
+# watcher 额外依赖
+RUN pip install --no-cache-dir \
+    watchdog \
+    pymupdf \
+    python-docx \
+    ebooklib \
+    beautifulsoup4 \
+    lxml \
+    python-pptx \
+    pytesseract \
+    Pillow
+
+ENV PYTHONPATH=/app
+
+CMD ["python", "-u", "kb_watcher.py"]
