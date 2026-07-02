@@ -846,15 +846,18 @@ async def api_graph_svg(request):
             title = node["title"][:28]
             tags = ", ".join(node.get("tags", [])[:3])
             label = f"{title}\\n{tags}" if tags else title
+            # 节点点击跳转到文档阅读页
+            view_url = f"/view/{node['id']}"
 
             if node["domain"] == "law":
                 dot.node(nid, label=label, fillcolor=LAW_FILL, fontcolor="#e2e8f0",
-                         color=LAW_BORDER, penwidth="1.0")
+                         color=LAW_BORDER, penwidth="1.0", URL=view_url, target="_self")
             elif node["domain"] == "writing":
                 dot.node(nid, label=label, fillcolor=WRITING_FILL, fontcolor="#e2e8f0",
-                         color=WRITING_BORDER, penwidth="1.0")
+                         color=WRITING_BORDER, penwidth="1.0", URL=view_url, target="_self")
             else:
-                dot.node(nid, label=label, fillcolor="#1e293b", fontcolor="#e2e8f0")
+                dot.node(nid, label=label, fillcolor="#1e293b", fontcolor="#e2e8f0",
+                         URL=view_url, target="_self")
 
         for edge in edges:
             src = edge["source"].replace("-", "_")[:20]
@@ -902,7 +905,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .controls input[type=range]{width:120px;accent-color:#3b82f6}
 .controls span{font-size:13px;color:#60a5fa;min-width:32px;font-weight:600}
 .graph-area{flex:1;overflow:auto;display:flex;align-items:flex-start;justify-content:center;padding:8px}
-.graph-area img{max-width:100%;height:auto;background:#0f172a}
+.graph-area img{max-width:100%;height:auto;background:#0f172a;cursor:pointer}
 .legend{display:flex;gap:16px;margin-left:20px}
 .legend span{font-size:12px;display:inline-flex;align-items:center;gap:4px}
 .legend .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
@@ -925,6 +928,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 </div>
 <div class="graph-area">
   <img id="graphImg" src="/api/graph_svg?min_similarity=__MIN_SIM__" alt="知识图谱" onerror="this.onerror=null;this.parentElement.innerHTML='<div class=error>图谱渲染失败。<br>请确认服务端 graphviz 已安装。<br><a href=/api/graph style=color:#60a5fa>查看原始数据</a></div>'">
+  <p style="color:#64748b;font-size:12px;text-align:center;margin-top:8px">💡 点击图谱节点可查看文档详情</p>
 </div>
 </body>
 </html>
