@@ -905,11 +905,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .controls input[type=range]{width:120px;accent-color:#3b82f6}
 .controls span{font-size:13px;color:#60a5fa;min-width:32px;font-weight:600}
 .graph-area{flex:1;overflow:auto;display:flex;align-items:flex-start;justify-content:center;padding:8px}
-.graph-area img{max-width:100%;height:auto;background:#0f172a;cursor:pointer}
+.graph-area svg{max-width:100%;height:auto;background:#0f172a}
 .legend{display:flex;gap:16px;margin-left:20px}
 .legend span{font-size:12px;display:inline-flex;align-items:center;gap:4px}
 .legend .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
 .error{color:#ef4444;text-align:center;padding:40px;font-size:14px}
+.hint{color:#64748b;font-size:12px;text-align:center;padding:4px 0}
 </style>
 </head>
 <body>
@@ -922,14 +923,35 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
   </div>
   <form class="controls" method="get" action="/graph">
     <label for="threshold">相似度阈值</label>
-    <input type="range" id="threshold" name="min_similarity" min="20" max="95" value="__THRESHOLD_VAL__" step="5" oninput="document.getElementById('val').textContent=(this.value/100).toFixed(2);this.form.submit()">
+    <input type="range" id="threshold" name="min_similarity" min="20" max="95" value="__THRESHOLD_VAL__" step="5"
+           oninput="document.getElementById('val').textContent=(this.value/100).toFixed(2);this.form.submit()">
     <span id="val">__THRESHOLD_DISPLAY__</span>
   </form>
 </div>
-<div class="graph-area">
-  <img id="graphImg" src="/api/graph_svg?min_similarity=__MIN_SIM__" alt="知识图谱" onerror="this.onerror=null;this.parentElement.innerHTML='<div class=error>图谱渲染失败。<br>请确认服务端 graphviz 已安装。<br><a href=/api/graph style=color:#60a5fa>查看原始数据</a></div>'">
-  <p style="color:#64748b;font-size:12px;text-align:center;margin-top:8px">💡 点击图谱节点可查看文档详情</p>
+<div class="hint">💡 点击图谱节点可查看文档详情</div>
+<div class="graph-area" id="graphArea">
+  <p style="color:#64748b">加载中...</p>
 </div>
+<script>
+async function loadGraph(){
+  var area = document.getElementById('graphArea');
+  area.innerHTML = '<p style="color:#64748b">加载中...</p>';
+  try {
+    var resp = await fetch('/api/graph_svg?min_similarity=__MIN_SIM__');
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    var svgText = await resp.text();
+    // 内联 SVG，使节点链接可点击
+    area.innerHTML = svgText;
+    // 确保所有内部链接在新窗口打开
+    area.querySelectorAll('a').forEach(function(a){
+      a.setAttribute('target','_self');
+    });
+  } catch(e) {
+    area.innerHTML = '<div class="error">图谱加载失败: '+e.message+'<br><a href="/api/graph" style="color:#60a5fa">查看原始数据</a></div>';
+  }
+}
+loadGraph();
+</script>
 </body>
 </html>
 """
