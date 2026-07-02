@@ -348,6 +348,162 @@ async def api_get_document(request):
 
 
 # ============================================================
+# 文档阅读页 — /view/{doc_id}
+# ============================================================
+
+VIEW_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TITLE__ - 知识库</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background:#0d1117;color:#d0d7de;line-height:1.8}
+.container{max-width:860px;margin:0 auto;padding:24px 32px 64px}
+header{margin-bottom:32px;padding-bottom:20px;border-bottom:1px solid #21262d}
+header .back{display:inline-flex;align-items:center;gap:6px;color:#58a6ff;text-decoration:none;font-size:14px;margin-bottom:12px}
+header .back:hover{text-decoration:underline}
+header h1{font-size:26px;font-weight:700;color:#e6edf3;line-height:1.4;word-break:break-word;margin-bottom:12px}
+.meta{display:flex;flex-wrap:wrap;gap:16px;font-size:13px;color:#8b949e}
+.meta span{display:inline-flex;align-items:center;gap:4px}
+.meta .tag{background:#161b22;border:1px solid #30363d;padding:2px 10px;border-radius:12px;font-size:12px;color:#79c0ff}
+.content{font-size:17px;color:#d0d7de}
+.content p{margin-bottom:1.2em;text-indent:2em;word-wrap:break-word;overflow-wrap:break-word}
+.content p:first-child{text-indent:0}
+.content h2,.content h3{color:#e6edf3;margin:1.5em 0 .6em;font-weight:600}
+.content blockquote{border-left:3px solid #30363d;margin:1em 0;padding:.5em 1em;color:#8b949e;background:#0d1117;border-radius:0 6px 6px 0}
+.content code{background:#161b22;padding:2px 6px;border-radius:4px;font-size:15px;color:#79c0ff}
+.content pre{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:16px;overflow-x:auto;margin:1em 0}
+.content pre code{background:none;padding:0;font-size:14px}
+.chunks-section{margin-top:40px;padding-top:20px;border-top:1px solid #21262d}
+.chunks-section h2{font-size:18px;color:#8b949e;margin-bottom:16px;font-weight:500}
+.chunk-item{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px 20px;margin-bottom:10px}
+.chunk-item .chunk-index{font-size:11px;color:#484f58;margin-bottom:6px}
+.chunk-item p{font-size:15px;color:#c9d1d9;margin:0;text-indent:0;line-height:1.75}
+@media(max-width:640px){
+.container{padding:16px}
+header h1{font-size:20px}
+.content{font-size:16px}
+}
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+<a class="back" href="/graph">← 返回知识图谱</a>
+<h1>__TITLE__</h1>
+<div class="meta">
+<span>👤 __AUTHOR__</span>
+<span>📂 __DOMAIN__</span>
+<span>🏷 __TAGS__</span>
+<span>📅 __DATE__</span>
+</div>
+</header>
+<div class="content">__CONTENT__</div>
+<div class="chunks-section" id="chunksSection">
+<h2>📄 文本分块 (__CHUNK_COUNT__ 段)</h2>
+<div id="chunksList"></div>
+</div>
+</div>
+<script>
+var chunksData=__CHUNKS_JSON__;
+if(chunksData&&chunksData.length){var list=document.getElementById("chunksList");chunksData.forEach(function(c,i){var d=document.createElement("div");d.className="chunk-item";d.innerHTML='<div class="chunk-index">#'+(i+1)+' (相似度 '+((c.similarity||0)*100).toFixed(0)+'%)</div><p>'+escHtml(c.text)+'</p>';list.appendChild(d);});}else{document.getElementById("chunksSection").style.display="none";}
+function escHtml(s){if(!s)return"";return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+</script>
+</body>
+</html>"""
+
+
+def _format_content_html(raw_text: str) -> str:
+    """将原始文本转为 HTML：按自然段分 <p>，保留段落缩进"""
+    import re
+    # 先清理多余空白
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    # 按双换行或多个空行分割段落
+    paragraphs = re.split(r'\n\s*\n+', text.strip())
+    result = []
+    for para in paragraphs:
+        # 清理单行内的换行和多余空白
+        clean = re.sub(r'[ \t]+', ' ', para.replace('\n', ' ')).strip()
+        if clean:
+            result.append(f'<p>{clean}</p>')
+    return '\n'.join(result)
+
+
+async def view_page(request):
+    """文档阅读页面 - GET /view/{doc_id}"""
+    try:
+        doc_id = request.path_params.get("doc_id", "")
+        if not doc_id:
+            return HTMLResponse("<html><body><h1>缺少文档ID</h1></body></html>", status_code=400)
+
+        doc = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: kb.get_document(doc_id)
+        )
+        if not doc:
+            return HTMLResponse("<html><body><h1>文档不存在</h1></body></html>", status_code=404)
+
+        title = doc.get("title", "未知文档")
+        author = doc.get("author", "未知")
+        domain_map = {"law": "法学", "writing": "创作"}
+        domain = domain_map.get(doc.get("domain", ""), doc.get("domain", ""))
+        tags = doc.get("tags", [])
+        tags_html = " ".join(
+            f'<span class="tag">{t}</span>' for t in tags[:8]
+        )
+        date_val = doc.get("published_at") or ""
+        content_raw = doc.get("content", "")
+
+        # 格式化正文为 HTML 段落
+        content_html = _format_content_html(content_raw)
+
+        # 获取分块数据
+        chunks = []
+        try:
+            chunks_result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: kb.search(query=title, limit=50, filter_doc_id=doc_id)
+            )
+            chunks = [
+                {"text": c.get("content", ""), "similarity": c.get("score", 0)}
+                for c in (chunks_result.get("results") or [])[:30]
+                if c.get("document_id") == doc_id or c.get("id") != doc_id
+            ]
+        except Exception:
+            pass
+
+        html = VIEW_PAGE_HTML
+        html = html.replace("__TITLE__", _esc_html(title))
+        html = html.replace("__AUTHOR__", _esc_html(author))
+        html = html.replace("__DOMAIN__", domain or "未分类")
+        html = html.replace("__TAGS__", tags_html or "无标签")
+        html = html.replace("__DATE__", date_val or "未知")
+        html = html.replace("__CONTENT__", content_html)
+        html = html.replace("__CHUNK_COUNT__", str(len(chunks)))
+        html = html.replace(
+            "__CHUNKS_JSON__",
+            json.dumps(chunks, ensure_ascii=False) if chunks else "[]",
+        )
+        return HTMLResponse(html)
+
+    except Exception as e:
+        log.error(f"View page error: {e}", exc_info=True)
+        return HTMLResponse(
+            f"<html><body><h1>错误: {_esc_html(str(e))}</h1></body></html>",
+            status_code=500,
+        )
+
+
+def _esc_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+# ============================================================
 # 网页上传界面 + 文本直接入库
 # ============================================================
 
@@ -802,6 +958,8 @@ app = Starlette(
         Route("/messages/", handle_messages, methods=["POST"]),
         # 健康检查
         Route("/health", health),
+        # 文档阅读页
+        Route("/view/{doc_id:str}", view_page),
         # 上传页面
         Route("/upload", upload_page),
         # 知识图谱页面
