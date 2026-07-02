@@ -127,13 +127,21 @@ def guess_domain(text: str, filename: str) -> str:
         law_indicators += 1
     if re.search(r"[\u4e00-\u9fff]+法[第章节]", text[:1000]):
         law_indicators += 1
+    # 学术论文通有词汇（在开头 3000 字中至少命中 1 个即 +1）
+    academic_tone = ["本文", "理论", "制度", "数据", "治理", "规制", "规范", "体系", "建构"]
+    if any(kw in text[:3000] for kw in academic_tone) and ("摘要" in text[:5000] or "关键词" in text[:5000]):
+        law_indicators += 1
 
     # 写作特征：章节标题、对话、叙事
     writing_indicators = 0
 
     # 章节标记（多种格式）
+    # 学术论文也有"第一章"等标记，当已检测到摘要+关键词时不加重权重
     if re.search(r"第[一二三四五六七八九十百千\d]+[章节回]", text):
-        writing_indicators += 2  # 章节标记权重更高
+        if law_indicators >= 2:
+            writing_indicators += 1  # 学术论文中的章节标记仅 +1
+        else:
+            writing_indicators += 2  # 小说章节标记权重更高
     if re.search(r"(楔子|序章|序言|尾声|番外|后记)", text[:500]):
         writing_indicators += 2
 
@@ -165,11 +173,12 @@ def guess_domain(text: str, filename: str) -> str:
         writing_indicators += 2
 
     # 判断逻辑
+    if law_indicators >= 3:
+        return "law"  # 强法学特征
     if law_indicators >= 2 and writing_indicators < 2:
         return "law"
-    if writing_indicators >= 2:
-        return "writing"
-    # 模糊地带：如果两类特征都不明显，看哪个更多
+    if writing_indicators >= 3 and writing_indicators >= law_indicators + 2:
+        return "writing"  # 需要明显的小说特征才能覆盖法学判定
     if writing_indicators > law_indicators:
         return "writing"
     return "law"  # 默认法学
@@ -410,14 +419,29 @@ def process_file(filepath: Path, kb: KnowledgeBase, db_tags: set, book_title: st
 
         log.info(f"        {len(text):,} 字符")
 
+        # 1.5 读取用户提供的元数据（.meta.json 侧车文件）
+        user_meta = {}
+        meta_filepath = filepath.with_suffix(filepath.suffix + ".meta.json")
+        if meta_filepath.exists():
+            try:
+                import json as _json
+                user_meta = _json.loads(meta_filepath.read_text(encoding="utf-8"))
+                log.info(f"  [1.5] 读取到用户元数据: {user_meta}")
+            except Exception as e:
+                log.warning(f"  ⚠ 元数据文件读取失败: {e}")
+
         # 2. 提取元数据
         log.info(f"  [2/5] 提取元数据...")
-        title = extract_title(text, filename)
-        author = extract_author(text, filename)
+        title = user_meta.get("title", "") or extract_title(text, filename)
+        author = user_meta.get("author", "") or extract_author(text, filename)
+        # 用户指定的 domain 优先于自动检测
+        if user_meta.get("domain"):
+            domain = user_meta["domain"]
+        else:
+            domain = guess_domain(text, filename)
         summary = extract_summary(text)
         keywords = extract_keywords(text)
         year = extract_year(text)
-        domain = guess_domain(text, filename)
         doc_type = guess_doc_type(text, filename, domain)
 
         log.info(f"       标题: {title[:60]}")
@@ -425,10 +449,20 @@ def process_file(filepath: Path, kb: KnowledgeBase, db_tags: set, book_title: st
         log.info(f"       领域: {domain} | 类型: {doc_type}")
         log.info(f"       关键词: {keywords}")
 
-        # 3. 自动标签
+        # 3. 自动标签 + 用户标签合并
         log.info(f"  [3/5] 自动打标签...")
         tags = auto_tag_enhanced(text, title, keywords, db_tags, domain=domain)
-        log.info(f"       标签: {tags}")
+        # 合并用户手动指定的标签（逗号分隔）
+        if user_meta.get("tags"):
+            user_tags = [t.strip() for t in user_meta["tags"].split(",") if t.strip()]
+            # 用户标签优先，去重后放在前面
+            existing_set = set(tags)
+            for ut in user_tags:
+                if ut not in existing_set:
+                    tags.insert(0, ut)
+                    existing_set.add(ut)
+            log.info(f"       合并用户标签: {user_tags}")
+        log.info(f"       最终标签: {tags}")
 
         # 4. 入库
         log.info(f"  [4/5] 录入数据库...")
@@ -466,6 +500,14 @@ def process_file(filepath: Path, kb: KnowledgeBase, db_tags: set, book_title: st
         try:
             shutil.move(str(filepath), str(dest))
             log.info(f"  📦 已归档: {dest.name}")
+            # 同时归档元数据侧车文件（如果存在）
+            if meta_filepath.exists():
+                try:
+                    meta_dest = ARCHIVE_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{meta_filepath.name}"
+                    shutil.move(str(meta_filepath), str(meta_dest))
+                    log.info(f"  📦 已归档元数据: {meta_dest.name}")
+                except FileNotFoundError:
+                    pass
         except FileNotFoundError:
             log.warning(f"  ⚠ 文件已不存在（可能已被其他进程处理）: {filepath}")
 

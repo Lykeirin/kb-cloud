@@ -2,50 +2,44 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# ============================================================
-# 构建参数：镜像源配置
-# 默认使用官方源；中国大陆用户可通过 build-arg 切换到国内镜像
-#   docker compose build --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-#     --build-arg HF_ENDPOINT=https://hf-mirror.com
-# ============================================================
-ARG PIP_INDEX_URL=https://pypi.org/simple/
-ARG PIP_TRUSTED_HOST=pypi.org
-ARG HF_ENDPOINT=https://huggingface.co
-
-# 安装系统依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 阿里云镜像加速 apt
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    graphviz \
     && rm -rf /var/lib/apt/lists/*
 
-# 配置 pip 镜像源
-RUN pip config set global.index-url ${PIP_INDEX_URL} && \
-    pip config set global.trusted-host ${PIP_TRUSTED_HOST}
+# 阿里云镜像加速 pip
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+    pip config set global.trusted-host mirrors.aliyun.com
 
 # 分步安装依赖（降低峰值内存，利用层缓存）
 COPY requirements.txt .
 
-# 1) torch 依赖包
+# 1) 先从阿里云镜像安装 torch 的依赖包（速度快）
 RUN pip install --no-cache-dir filelock typing-extensions "setuptools<82" sympy networkx jinja2 fsspec mpmath markupsafe
 
-# 2) torch 本体（CPU 版，仅 ~192MB）
+# 2) 用 --no-deps 单独从 PyTorch 官方索引下载 torch 本体（仅 192MB whl）
 RUN pip install --no-cache-dir --no-deps torch --index-url https://download.pytorch.org/whl/cpu
 
-# 3) sentence-transformers
+# 3) sentence-transformers 及其依赖（从阿里云镜像）
 RUN pip install --no-cache-dir sentence-transformers
 
 # 4) 项目依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 预下载模型文件（放在 COPY 之前，代码变更不触发模型重下载）
+ENV HF_ENDPOINT=https://hf-mirror.com
+ENV HF_HOME=/root/.cache/huggingface
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-large-zh-v1.5', allow_patterns=['*.json','*.txt','*.bin','*.safetensors','tokenizer*','vocab*','sentence_bert_config*','modules.json','config.json','special_tokens*'])" \
+    && echo "Model files downloaded successfully"
+
 # 复制应用代码
 COPY server_http.py .
 COPY kb_core.py .
 COPY embedder.py .
-
-# 预下载 Embedding 模型（BAAI/bge-large-zh-v1.5, 1024 维）
-ENV HF_ENDPOINT=${HF_ENDPOINT}
-ENV HF_HOME=/root/.cache/huggingface
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-large-zh-v1.5', allow_patterns=['*.json','*.txt','*.bin','*.safetensors','tokenizer*','vocab*','sentence_bert_config*','modules.json','config.json','special_tokens*'])" \
-    && echo "Model files downloaded successfully"
+COPY pdf_extractor.py .
 
 EXPOSE 8765
 
