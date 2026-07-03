@@ -22,6 +22,8 @@ from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse, HTMLResponse
 from starlette.staticfiles import StaticFiles
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
@@ -41,6 +43,57 @@ log.info(f"Embedding 模型就绪，维度: {_embedder.dim}")
 # 数据库连接
 kb = KnowledgeBase()
 log.info("数据库连接就绪")
+
+
+# ============================================================
+# Basic Auth 中间件 — 保护 Web UI 和 REST API（公网访问需认证）
+# ============================================================
+
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    """HTTP Basic Auth — 从 KB_HTTP_AUTH 环境变量读取凭据 (格式: username:password)
+    豁免路径: /sse, /messages/ (MCP SSE 传输), /health (容器健康检查)
+    """
+
+    EXEMPT_PREFIXES = ("/sse", "/messages/")
+    EXEMPT_EXACT = ("/health",)
+
+    def __init__(self, app, auth_config: str = None):
+        super().__init__(app)
+        if auth_config and ":" in auth_config:
+            self._user, self._pass = auth_config.split(":", 1)
+        else:
+            self._user = self._pass = None  # 未配置则不启用
+
+    async def dispatch(self, request, call_next):
+        # 未配置认证 → 直接放行
+        if not self._user:
+            return await call_next(request)
+
+        path = request.url.path
+        # 豁免 MCP 传输和容器健康检查
+        if path in self.EXEMPT_EXACT:
+            return await call_next(request)
+        for prefix in self.EXEMPT_PREFIXES:
+            if path.startswith(prefix):
+                return await call_next(request)
+
+        # 验证 Authorization 头
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+                username, password = decoded.split(":", 1)
+                if username == self._user and password == self._pass:
+                    return await call_next(request)
+            except Exception:
+                pass
+
+        # 认证失败 → 401（浏览器弹出登录框）
+        return JSONResponse(
+            {"error": "Authentication required"},
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="KB-Cloud"'},
+        )
 
 # MCP Server
 server = Server("knowledge-base")
@@ -1779,8 +1832,7 @@ async def static_fallback(scope, receive, send):
 
 
 app = Starlette(
-    routes=[
-        # MCP SSE 传输
+    routes=[        # MCP SSE 传输
         Route("/sse", handle_sse),
         Route("/messages/", handle_messages, methods=["POST"]),
         # 健康检查
@@ -1825,6 +1877,9 @@ app = Starlette(
         Route("/api/multiperspective", api_multiperspective, methods=["POST"]),
         # 静态资源（带 fallback）
         Mount("/static", app=static_fallback, name="static"),
+    ],
+    middleware=[
+        Middleware(BasicAuthMiddleware, auth_config=os.getenv("KB_HTTP_AUTH")),
     ],
 )
 
