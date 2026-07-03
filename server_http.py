@@ -151,6 +151,29 @@ async def list_tools() -> list[Tool]:
                 "properties": {},
             },
         ),
+        Tool(
+            name="kb_concept_search",
+            description="概念检索：搜索知识库中自动抽取的学术概念（从文档中 KeyBERT 提取）。支持按概念名称模糊搜索，返回概念关联的文档数量和相关概念。可用于文献综述时快速找到某个概念在不同文档中的论述。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "概念名称或关键词"},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="kb_concept_detail",
+            description="获取单个概念的详细信息：关联文档列表、相关概念网络（共现分析）、概念类别。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concept_id": {"type": "string", "description": "概念 UUID"},
+                },
+                "required": ["concept_id"],
+            },
+        ),
     ]
 
 
@@ -221,6 +244,20 @@ def _run_tool(name: str, args: dict) -> dict:
         return {"tags": kb.get_tags(domain=args.get("domain"))}
     elif name == "kb_stats":
         return {"stats": kb.get_stats()}
+    elif name == "kb_concept_search":
+        return {
+            "concepts": kb.search_concepts(
+                query=args["query"],
+                limit=args.get("limit", 20),
+            )
+        }
+    elif name == "kb_concept_detail":
+        concept = kb.get_concept(args["concept_id"])
+        if concept is None:
+            return {"error": "Concept not found"}
+        # 附带相关概念
+        concept["related_concepts"] = kb.get_related_concepts(args["concept_id"], limit=10)
+        return {"concept": concept}
     else:
         return {"error": f"Unknown tool: {name}"}
 
@@ -767,6 +804,269 @@ async def api_ingest_text(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ============================================================
+# REST API — 概念系统
+# ============================================================
+
+async def api_concepts_list(request):
+    """列出概念 — GET /api/concepts?category=法学概念&sort=doc_count&limit=50"""
+    try:
+        category = request.query_params.get("category")
+        sort_by = request.query_params.get("sort", "doc_count")
+        limit = min(int(request.query_params.get("limit", "50")), 200)
+        concepts = kb.list_concepts(category=category, sort_by=sort_by, limit=limit)
+        return JSONResponse({"concepts": concepts, "total": len(concepts)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_concepts_search(request):
+    """搜索概念 — GET /api/concepts/search?q=物权行为&limit=20"""
+    try:
+        query = request.query_params.get("q", "")
+        if not query:
+            return JSONResponse({"error": "Missing query parameter 'q'"}, status_code=400)
+        limit = min(int(request.query_params.get("limit", "20")), 100)
+        concepts = kb.search_concepts(query=query, limit=limit)
+        return JSONResponse({"concepts": concepts, "total": len(concepts)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_concept_detail(request):
+    """获取概念详情 — GET /api/concept/{concept_id}"""
+    try:
+        concept_id = request.path_params.get("concept_id", "")
+        include_related = request.query_params.get("related", "1") == "1"
+        concept = kb.get_concept(concept_id)
+        if not concept:
+            return JSONResponse({"error": "Concept not found"}, status_code=404)
+        if include_related:
+            concept["related_concepts"] = kb.get_related_concepts(concept_id, limit=10)
+        return JSONResponse({"concept": concept})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_concept_extract(request):
+    """为已有文档批量抽取概念 — POST /api/concept/extract
+    Body: {"doc_id": "uuid", "max_docs": 0}
+    如果不传 doc_id，则为所有未抽取过的文档批量处理。
+    """
+    try:
+        body = {}
+        if request.method == "POST":
+            body = await request.json()
+        doc_id = body.get("doc_id")
+        if doc_id:
+            concepts = kb.extract_concepts(doc_id, top_n=10)
+            return JSONResponse({"status": "ok", "doc_id": doc_id, "concepts": concepts})
+        else:
+            max_docs = body.get("max_docs", 0)
+            result = kb.extract_concepts_for_existing(max_docs=max_docs)
+            return JSONResponse({"status": "ok", **result})
+    except Exception as e:
+        log.error(f"API concept_extract error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_concept_stats(request):
+    """概念统计 — GET /api/concept/stats"""
+    try:
+        stats = kb.get_concept_stats()
+        return JSONResponse({"stats": stats})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ============================================================
+# 网页页面 — 概念浏览
+# ============================================================
+
+CONCEPTS_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>概念检索 - KB-Cloud</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.header{padding:12px 20px;background:#1e293b;border-bottom:1px solid #334155;display:flex;align-items:center;gap:16px}
+.header h1{font-size:16px;font-weight:600;white-space:nowrap}
+.header a{color:#60a5fa;text-decoration:none;font-size:13px}
+.header .nav{gap:12px;display:flex}
+.search-box{flex:1;display:flex;gap:8px;margin:0 20px}
+.search-box input{flex:1;padding:6px 12px;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:14px}
+.search-box input:focus{outline:none;border-color:#3b82f6}
+.search-box button{padding:6px 16px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+.container{max-width:960px;margin:20px auto;padding:0 20px}
+.stats-bar{display:flex;gap:24px;margin-bottom:20px;padding:12px 16px;background:#1e293b;border-radius:8px;font-size:13px;color:#94a3b8}
+.stats-bar strong{color:#e2e8f0;font-size:16px}
+.concept-list{display:flex;flex-direction:column;gap:8px}
+.concept-card{background:#1e293b;border-radius:8px;padding:14px 18px;display:flex;align-items:center;gap:16px;transition:background .15s;text-decoration:none;color:inherit}
+.concept-card:hover{background:#273548}
+.concept-name{font-size:15px;font-weight:600;color:#e2e8f0;flex:1}
+.concept-category{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500;white-space:nowrap}
+.cat-law{background:#1e3a5f;color:#60a5fa}
+.cat-theory{background:#1e3a5f;color:#a78bfa}
+.cat-method{background:#1e3a5f;color:#34d399}
+.cat-case{background:#292524;color:#fbbf24}
+.cat-general{background:#1e293b;color:#94a3b8}
+.cat-article{background:#292524;color:#f87171}
+.concept-count{font-size:12px;color:#64748b;min-width:40px;text-align:center}
+.concept-count strong{display:block;font-size:18px;color:#60a5fa}
+.tabs{display:flex;gap:4px;margin-bottom:16px}
+.tabs button{padding:6px 14px;border:1px solid #334155;border-radius:6px;background:transparent;color:#94a3b8;cursor:pointer;font-size:13px}
+.tabs button.active{background:#3b82f6;color:#fff;border-color:#3b82f6}
+.empty{text-align:center;padding:60px 20px;color:#64748b}
+.concept-detail{background:#1e293b;border-radius:8px;padding:20px}
+.concept-detail h2{font-size:20px;margin-bottom:8px}
+.concept-detail .meta{font-size:13px;color:#94a3b8;margin-bottom:16px}
+.concept-detail .related{margin-top:16px}
+.concept-detail .related h3{font-size:14px;margin-bottom:8px;color:#94a3b8}
+.related-tag{display:inline-block;padding:4px 10px;background:#1e3a5f;color:#60a5fa;border-radius:12px;margin:2px 4px;font-size:12px;text-decoration:none}
+.related-tag:hover{background:#2d5080}
+.doc-link{display:block;padding:8px 12px;border-left:2px solid #3b82f6;margin:4px 0;font-size:13px;color:#94a3b8;text-decoration:none}
+.doc-link:hover{color:#e2e8f0;background:#1e293b}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>KB-Cloud 概念检索</h1>
+  <div class="nav">
+    <a href="/graph">知识图谱</a>
+    <a href="/upload">上传文档</a>
+  </div>
+  <div class="search-box">
+    <input type="text" id="searchInput" placeholder="搜索概念..." onkeydown="if(event.key==='Enter')searchConcepts()">
+    <button onclick="searchConcepts()">搜索</button>
+  </div>
+</div>
+<div class="container">
+  <div class="stats-bar" id="statsBar">加载中...</div>
+  <div class="tabs">
+    <button class="active" onclick="switchTab('all')">全部</button>
+    <button onclick="switchTab('法学概念')">法学概念</button>
+    <button onclick="switchTab('学术理论')">学术理论</button>
+    <button onclick="switchTab('方法论')">方法论</button>
+    <button onclick="switchTab('案例引用')">案例引用</button>
+  </div>
+  <div id="content">
+    <div class="concept-list" id="conceptList">加载中...</div>
+  </div>
+</div>
+<script>
+var currentTab = 'all';
+var allConcepts = [];
+
+async function loadStats(){
+  try{var r=await fetch('/api/concept/stats');var d=await r.json();
+  document.getElementById('statsBar').innerHTML='<span>总概念: <strong>'+d.stats.total_concepts+'</strong></span><span>总关联: <strong>'+d.stats.total_links+'</strong></span>';
+  }catch(e){}
+}
+
+async function loadConcepts(category){
+  currentTab = category || 'all';
+  var tabs = document.querySelectorAll('.tabs button');
+  tabs.forEach(function(b){b.classList.toggle('active', b.textContent === (category||'全部'));});
+  
+  var url = '/api/concepts?sort=doc_count&limit=100';
+  if(category && category !== 'all') url += '&category=' + encodeURIComponent(category);
+  
+  try{
+    var r = await fetch(url);
+    var d = await r.json();
+    allConcepts = d.concepts || [];
+    renderConcepts(allConcepts);
+  }catch(e){
+    document.getElementById('conceptList').innerHTML = '<div class="empty">加载失败</div>';
+  }
+}
+
+function renderConcepts(concepts){
+  if(!concepts.length){
+    document.getElementById('conceptList').innerHTML = '<div class="empty">暂无概念数据<br>上传文档后系统将自动抽取概念</div>';
+    return;
+  }
+  var html = '';
+  for(var i=0;i<concepts.length;i++){
+    var c = concepts[i];
+    var catClass = 'cat-general';
+    if(c.category === '法学概念') catClass='cat-law';
+    else if(c.category === '学术理论') catClass='cat-theory';
+    else if(c.category === '方法论') catClass='cat-method';
+    else if(c.category === '案例引用') catClass='cat-case';
+    else if(c.category === '法条引用') catClass='cat-article';
+    html += '<a class="concept-card" href="javascript:showDetail(\''+c.id+'\')">';
+    html += '<span class="concept-name">'+c.name+'</span>';
+    html += '<span class="concept-category '+catClass+'">'+c.category+'</span>';
+    html += '<span class="concept-count"><strong>'+c.doc_count+'</strong>篇</span>';
+    html += '</a>';
+  }
+  document.getElementById('conceptList').innerHTML = html;
+}
+
+async function searchConcepts(){
+  var q = document.getElementById('searchInput').value.trim();
+  if(!q){loadConcepts(currentTab);return;}
+  try{
+    var r = await fetch('/api/concepts/search?q='+encodeURIComponent(q)+'&limit=50');
+    var d = await r.json();
+    allConcepts = d.concepts || [];
+    renderConcepts(d.concepts||[]);
+  }catch(e){}
+}
+
+function switchTab(cat){loadConcepts(cat);}
+
+async function showDetail(id){
+  try{
+    var r = await fetch('/api/concept/'+id+'?related=1');
+    var d = await r.json();
+    var c = d.concept;
+    var html = '<div class="concept-detail">';
+    html += '<h2>'+c.name+'</h2>';
+    html += '<div class="meta">类别: '+c.category+' | 关联文档: '+c.doc_count+'篇 | 更新: '+(c.updated_at||'').substr(0,10)+'</div>';
+    html += '<button onclick="loadConcepts(currentTab)" style="padding:4px 12px;background:#3b82f6;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-bottom:16px">← 返回列表</button>';
+    
+    if(c.related_concepts && c.related_concepts.length){
+      html += '<div class="related"><h3>相关概念</h3>';
+      for(var i=0;i<c.related_concepts.length;i++){
+        var rc = c.related_concepts[i];
+        html += '<a class="related-tag" href="javascript:showDetail(\''+rc.id+'\')">'+rc.name+' ('+rc.co_occurrence+')</a>';
+      }
+      html += '</div>';
+    }
+    
+    if(c.documents && c.documents.length){
+      html += '<div class="related" style="margin-top:20px"><h3>关联文档</h3>';
+      for(var i=0;i<c.documents.length;i++){
+        var doc = c.documents[i];
+        html += '<a class="doc-link" href="/view/'+doc.id+'">'+doc.title+' <span style="color:#64748b">('+doc.author+')</span></a>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    document.getElementById('conceptList').innerHTML = html;
+  }catch(e){
+    document.getElementById('conceptList').innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
+  }
+}
+
+loadStats();
+loadConcepts('all');
+</script>
+</body>
+</html>
+"""
+
+
+async def concepts_page(request):
+    """概念浏览页面 — GET /concepts"""
+    return HTMLResponse(CONCEPTS_PAGE_HTML)
+
+
 async def graph_page(request):
     """知识图谱可视化页面 - GET /graph（Graphviz 服务端渲染，零前端依赖）"""
     min_sim = request.query_params.get("min_similarity", "0.65")
@@ -1007,6 +1307,8 @@ app = Starlette(
         Route("/upload", upload_page),
         # 知识图谱页面
         Route("/graph", graph_page),
+        # 概念浏览页面
+        Route("/concepts", concepts_page),
         # REST API（供 OpenWebUI 等外部应用）
         Route("/api/search", api_search, methods=["GET", "POST"]),
         Route("/api/semantic_search", api_semantic_search, methods=["POST"]),
@@ -1017,6 +1319,12 @@ app = Starlette(
         Route("/api/get/{doc_id:str}", api_get_document, methods=["GET"]),
         Route("/api/upload", api_upload, methods=["POST"]),
         Route("/api/ingest_text", api_ingest_text, methods=["POST"]),
+        # 概念系统 API
+        Route("/api/concepts", api_concepts_list, methods=["GET"]),
+        Route("/api/concepts/search", api_concepts_search, methods=["GET"]),
+        Route("/api/concept/stats", api_concept_stats, methods=["GET"]),
+        Route("/api/concept/extract", api_concept_extract, methods=["POST"]),
+        Route("/api/concept/{concept_id:str}", api_concept_detail, methods=["GET"]),
         # 静态资源（带 fallback）
         Mount("/static", app=static_fallback, name="static"),
     ],

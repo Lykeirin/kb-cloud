@@ -494,6 +494,19 @@ def process_file(filepath: Path, kb: KnowledgeBase, db_tags: set, book_title: st
         doc_id = result.get("id", "?")
         log.info(f"  ✅ 入库成功: {doc_id[:8]}... ({title[:40]})")
 
+        # 4.5 抽取关键概念（KeyBERT + 知识复利）
+        log.info(f"  [4.5/5] 抽取关键概念...")
+        try:
+            concepts = kb.extract_concepts(doc_id, top_n=10)
+            if concepts:
+                top_names = [c["name"] for c in concepts[:5]]
+                new_count = sum(1 for c in concepts if c.get("is_new"))
+                log.info(f"       抽取到 {len(concepts)} 个概念: {', '.join(top_names)}{'...' if len(concepts) > 5 else ''}")
+            else:
+                log.info(f"       ⚠ 未抽取到概念（文本可能过短或模型未就绪）")
+        except Exception as e:
+            log.warning(f"  ⚠ 概念抽取失败（不影响入库）: {e}")
+
         # 5. 归档
         log.info(f"  [5/5] 归档到 {ARCHIVE_DIR}/")
         dest = ARCHIVE_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"

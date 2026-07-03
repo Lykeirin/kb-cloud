@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import uuid
 import logging
 from datetime import date, datetime
@@ -658,3 +659,416 @@ class KnowledgeBase:
             )
 
             return {"nodes": nodes, "edges": edges}
+
+    # ============================================================
+    # 概念系统（KeyBERT 自动抽取 + 知识复利）
+    # ============================================================
+
+    @staticmethod
+    def _normalize_concept(name: str) -> str:
+        """归一化概念名称，用于去重"""
+        n = name.strip().lower()
+        n = re.sub(r'[\s\u3000\-_·•、，。；：！？""''（）【】《》]', '', n)
+        return n
+
+    @staticmethod
+    def _classify_concept(name: str) -> str:
+        """根据名称启发式分类"""
+        law_keywords = ['法', '权', '诉', '判', '罪', '刑', '合同', '侵权', '物权',
+                        '债权', '不当得利', '无因管理', '善意取得', '公示公信']
+        theory_keywords = ['理论', '学说', '主义', '学派', '思想', '体系']
+        method_keywords = ['数据', '算法', '模型', '框架', '路径', '机制', '构建']
+        article_keywords = ['第', '条', '款', '项']
+        case_keywords = ['案例', '判决', '法院', '裁判']
+
+        if any(k in name for k in case_keywords):
+            return '案例引用'
+        if any(k in name for k in article_keywords):
+            return '法条引用'
+        if any(k in name for k in law_keywords):
+            return '法学概念'
+        if any(k in name for k in theory_keywords):
+            return '学术理论'
+        if any(k in name for k in method_keywords):
+            return '方法论'
+        return '通用概念'
+
+    def extract_concepts(self, doc_id: str, top_n: int = 10) -> list[dict]:
+        """
+        从文档中提取关键概念（KeyBERT + MMR 多样性保证）。
+
+        复用已有的 bge-large-zh-v1.5 embedding 模型，不额外加载模型。
+        概念去重后存入 concepts 表，建立 document_concepts 关联。
+        """
+        from embedder import get_embedder
+
+        # 获取文档正文
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT content, title, domain FROM documents WHERE id = %s",
+                (doc_id,),
+            )
+            row = cur.fetchone()
+            if not row or not row[0]:
+                logger.warning(f"extract_concepts: 文档 {doc_id[:8]} 无内容")
+                return []
+            content = row[0]
+            domain = row[2] or "law"
+
+        # 文本预处理（取前 8000 字足矣）
+        extract_text = content[:8000]
+
+        # 概念提取：优先 jieba TF-IDF（轻量、离线、无模型加载开销）
+        # 如 jieba 不可用，回退到 KeyBERT（需要 embedder 模型）
+        try:
+            keyphrases = self._extract_concepts_tfidf(extract_text, top_n)
+            if not keyphrases:
+                raise RuntimeError("jieba returned empty")
+        except Exception as e:
+            logger.warning(f"jieba 提取失败，尝试 KeyBERT: {e}")
+            try:
+                from keybert import KeyBERT
+                embedder = get_embedder()
+                kw_model = KeyBERT(model=embedder._model)
+                keyphrases = kw_model.extract_keywords(
+                    extract_text,
+                    keyphrase_ngram_range=(1, 4),
+                    stop_words=None,
+                    top_n=top_n,
+                    use_mmr=True,
+                    diversity=0.7,
+                )
+            except ImportError:
+                logger.warning("keybert 未安装")
+                keyphrases = []
+            except Exception as e2:
+                logger.warning(f"KeyBERT 提取失败: {e2}")
+                keyphrases = []
+
+        if not keyphrases:
+            return []
+
+        # 批量检查已有概念 + 生成 embedding
+        unique_phrases = []
+        seen_norm = set()
+        for phrase, score in keyphrases:
+            normalized = self._normalize_concept(phrase)
+            if not normalized or len(normalized) < 2 or normalized in seen_norm:
+                continue
+            seen_norm.add(normalized)
+            unique_phrases.append((phrase, score))
+
+        # 查询已存在的概念
+        normalized_list = [self._normalize_concept(p[0]) for p in unique_phrases]
+        existing_map = {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, normalized FROM concepts WHERE normalized = ANY(%s)",
+                (normalized_list,),
+            )
+            for row in cur.fetchall():
+                existing_map[row[1]] = row[0]
+
+        # 生成概念 embedding（用于未来语义搜索）
+        try:
+            embedder = get_embedder()
+        except Exception:
+            embedder = None
+
+        # 插入新概念 + 建立关联
+        concepts_result = []
+        with self.conn.cursor() as cur:
+            for phrase, score in unique_phrases:
+                normalized = self._normalize_concept(phrase)
+                category = self._classify_concept(phrase)
+
+                if normalized in existing_map:
+                    concept_id = existing_map[normalized]
+                    cur.execute(
+                        "UPDATE concepts SET doc_count = doc_count + 1, updated_at = NOW() WHERE id = %s",
+                        (concept_id,),
+                    )
+                else:
+                    concept_id = str(uuid.uuid4())
+                    concept_emb = None
+                    if embedder:
+                        try:
+                            concept_emb = embedder.encode(phrase)
+                        except Exception:
+                            pass
+
+                    cur.execute(
+                        """INSERT INTO concepts (id, name, normalized, category, doc_count, embedding)
+                        VALUES (%s, %s, %s, %s, 1, %s)""",
+                        (concept_id, phrase, normalized, category, concept_emb),
+                    )
+
+                # 建立文档-概念关联
+                cur.execute(
+                    """INSERT INTO document_concepts (document_id, concept_id, relevance)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (document_id, concept_id) DO UPDATE
+                    SET relevance = EXCLUDED.relevance""",
+                    (doc_id, concept_id, round(float(score) * 10, 4)),
+                )
+
+                concepts_result.append({
+                    "id": concept_id,
+                    "name": phrase,
+                    "category": category,
+                    "relevance": round(float(score), 4),
+                })
+
+        self.conn.commit()
+        logger.info(
+            "概念抽取完成: doc=%s..., 抽取 %d 个概念 (新增 %d)",
+            doc_id[:8], len(concepts_result),
+            len(concepts_result) - len(existing_map),
+        )
+        return concepts_result
+
+    def _extract_concepts_tfidf(self, text: str, top_n: int = 10) -> list[tuple]:
+        """
+        TF-IDF 关键词提取（KeyBERT 不可用时的回退方案）。
+        使用 jieba 分词 + TF-IDF 权重，过滤学术通用停用词。
+        """
+        # 学术论文通用停用词（这些词太泛，不应作为"概念"）
+        _STOP_WORDS = {
+            '研究', '分析', '理论', '思想', '发展', '问题', '影响', '作用',
+            '关系', '意义', '价值', '特征', '特点', '过程', '形成', '方面',
+            '方式', '方法', '内容', '结构', '体系', '制度', '社会', '国家',
+            '本文', '认为', '提出', '进行', '具有', '存在', '可以', '需要',
+            '这一', '一个', '一种', '不同', '主要', '重要', '相关', '基本',
+        }
+
+        try:
+            import jieba.analyse
+
+            # 使用 jieba TF-IDF
+            tags = jieba.analyse.extract_tags(text, topK=top_n * 3, withWeight=True)
+
+            # 过滤单字和停用词
+            result = [(word, weight) for word, weight in tags
+                      if len(word) >= 2 and word not in _STOP_WORDS]
+
+            # 补充 TextRank（提取短语，权重减半）
+            try:
+                tr_tags = jieba.analyse.textrank(text, topK=top_n * 2, withWeight=True)
+                tr_filtered = [(w, wgt * 0.5) for w, wgt in tr_tags
+                               if len(w) >= 2 and w not in _STOP_WORDS]
+                result.extend(tr_filtered)
+            except Exception:
+                pass
+
+            # 去重（按名称），取 top_n
+            seen = set()
+            deduped = []
+            for word, weight in sorted(result, key=lambda x: x[1], reverse=True):
+                if word not in seen and len(word) >= 2:
+                    seen.add(word)
+                    deduped.append((word, weight))
+                if len(deduped) >= top_n:
+                    break
+
+            return deduped
+        except ImportError:
+            logger.warning("jieba 未安装，概念提取不可用")
+            return []
+
+    def search_concepts(self, query: str, limit: int = 20) -> list[dict]:
+        """按名称搜索概念（支持模糊匹配）"""
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            search_pattern = f"%{query}%"
+            cur.execute(
+                """SELECT id, name, category, doc_count, created_at
+                FROM concepts
+                WHERE name ILIKE %s OR normalized ILIKE %s
+                ORDER BY doc_count DESC, created_at DESC
+                LIMIT %s""",
+                (search_pattern, search_pattern, limit),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": str(r["id"]),
+                    "name": r["name"],
+                    "category": r["category"],
+                    "doc_count": r["doc_count"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                }
+                for r in rows
+            ]
+
+    def get_concept(self, concept_id: str) -> Optional[dict]:
+        """获取概念详情及其关联文档"""
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 概念基本信息
+            cur.execute(
+                """SELECT id, name, category, summary, doc_count, created_at, updated_at
+                FROM concepts WHERE id = %s""",
+                (concept_id,),
+            )
+            concept = cur.fetchone()
+            if not concept:
+                return None
+
+            # 关联文档
+            cur.execute(
+                """SELECT d.id, d.title, d.author, d.domain, dc.relevance
+                FROM document_concepts dc
+                JOIN documents d ON dc.document_id = d.id
+                WHERE dc.concept_id = %s AND d.status = 'ready'
+                ORDER BY dc.relevance DESC
+                LIMIT 30""",
+                (concept_id,),
+            )
+            docs = [
+                {
+                    "id": str(d["id"]),
+                    "title": d["title"],
+                    "author": d["author"],
+                    "domain": d["domain"],
+                    "relevance": float(d["relevance"]),
+                }
+                for d in cur.fetchall()
+            ]
+
+            return {
+                "id": str(concept["id"]),
+                "name": concept["name"],
+                "category": concept["category"],
+                "summary": concept["summary"],
+                "doc_count": concept["doc_count"],
+                "documents": docs,
+                "created_at": concept["created_at"].isoformat() if concept["created_at"] else None,
+                "updated_at": concept["updated_at"].isoformat() if concept["updated_at"] else None,
+            }
+
+    def list_concepts(
+        self,
+        category: Optional[str] = None,
+        sort_by: str = "doc_count",
+        limit: int = 50,
+    ) -> list[dict]:
+        """列出概念（可按分类筛选、按文档数/时间排序）"""
+        valid_sorts = {"doc_count": "doc_count DESC", "recent": "created_at DESC", "name": "name ASC"}
+        order = valid_sorts.get(sort_by, "doc_count DESC")
+
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if category:
+                cur.execute(
+                    f"""SELECT id, name, category, doc_count, created_at
+                    FROM concepts WHERE category = %s
+                    ORDER BY {order} LIMIT %s""",
+                    (category, limit),
+                )
+            else:
+                cur.execute(
+                    f"""SELECT id, name, category, doc_count, created_at
+                    FROM concepts ORDER BY {order} LIMIT %s""",
+                    (limit,),
+                )
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": str(r["id"]),
+                    "name": r["name"],
+                    "category": r["category"],
+                    "doc_count": r["doc_count"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                }
+                for r in rows
+            ]
+
+    def get_related_concepts(self, concept_id: str, limit: int = 10) -> list[dict]:
+        """
+        获取相关概念：在同一文档中共现的概念（按共现次数排序）。
+        这是"知识复利"的关键——概念之间的语义网络随文档增多自动增强。
+        """
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT c2.id, c2.name, c2.category, c2.doc_count,
+                       COUNT(DISTINCT dc1.document_id) AS co_occurrence
+                FROM document_concepts dc1
+                JOIN document_concepts dc2 ON dc1.document_id = dc2.document_id
+                    AND dc2.concept_id != %s
+                JOIN concepts c2 ON dc2.concept_id = c2.id
+                WHERE dc1.concept_id = %s
+                GROUP BY c2.id, c2.name, c2.category, c2.doc_count
+                ORDER BY co_occurrence DESC, c2.doc_count DESC
+                LIMIT %s""",
+                (concept_id, concept_id, limit),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": str(r["id"]),
+                    "name": r["name"],
+                    "category": r["category"],
+                    "doc_count": r["doc_count"],
+                    "co_occurrence": r["co_occurrence"],
+                }
+                for r in rows
+            ]
+
+    def get_concept_stats(self) -> dict:
+        """获取概念统计信息"""
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM concepts")
+            total = cur.fetchone()["total"]
+
+            cur.execute(
+                """SELECT category, COUNT(*) AS cnt
+                FROM concepts GROUP BY category ORDER BY cnt DESC"""
+            )
+            breakdown = {r["category"]: r["cnt"] for r in cur.fetchall()}
+
+            cur.execute("SELECT COUNT(*) AS total FROM document_concepts")
+            links = cur.fetchone()["total"]
+
+            cur.execute(
+                """SELECT name, doc_count FROM concepts
+                ORDER BY doc_count DESC LIMIT 10"""
+            )
+            top_concepts = [
+                {"name": r["name"], "doc_count": r["doc_count"]}
+                for r in cur.fetchall()
+            ]
+
+        return {
+            "total_concepts": total,
+            "total_links": links,
+            "breakdown": breakdown,
+            "top_concepts": top_concepts,
+        }
+
+    def extract_concepts_for_existing(self, max_docs: int = 0) -> dict:
+        """
+        为已有文档批量抽取概念（用于首次迁移）。
+        
+        Args:
+            max_docs: 最多处理多少篇文档（0=全部）
+        
+        Returns:
+            {"processed": N, "total_concepts": N}
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT id FROM documents WHERE status = 'ready'
+                AND id NOT IN (SELECT DISTINCT document_id FROM document_concepts)
+                ORDER BY created_at DESC"""
+            )
+            if max_docs > 0:
+                rows = cur.fetchmany(max_docs)
+            else:
+                rows = cur.fetchall()
+
+        total_concepts = 0
+        for (doc_id,) in rows:
+            try:
+                result = self.extract_concepts(doc_id)
+                total_concepts += len(result)
+            except Exception as e:
+                logger.error(f"概念抽取失败 doc={doc_id[:8]}: {e}")
+
+        return {"processed": len(rows), "total_concepts": total_concepts}

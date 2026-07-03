@@ -80,6 +80,31 @@ CREATE TABLE document_tags (
 );
 
 -- ============================================================
+-- 3b. 概念系统（KeyBERT 自动抽取 + 知识复利）
+-- ============================================================
+CREATE TABLE concepts (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name            TEXT NOT NULL,            -- 概念名称（如"物权行为无因性"）
+    normalized      TEXT NOT NULL UNIQUE,      -- 归一化名称（去空格/标点，用于去重）
+    category        TEXT,                     -- 概念类别：法学争议/学术概念/方法论/案例引用
+    summary         TEXT,                     -- 所有来源文档中关于该概念的论述聚合
+    doc_count       INTEGER DEFAULT 0,        -- 关联文档数（知识复利指标）
+    embedding       vector(1024),             -- 概念名 embedding（用于概念语义搜索）
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE document_concepts (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    concept_id      UUID NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    relevance       REAL DEFAULT 1.0,        -- 该概念在此文档中的相关度
+    context         TEXT,                     -- 概念出现的原文上下文（约100字）
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(document_id, concept_id)
+);
+
+-- ============================================================
 -- 4. 索引
 -- ============================================================
 
@@ -105,6 +130,13 @@ CREATE INDEX idx_chunks_document ON chunks(document_id);
 CREATE INDEX idx_tags_domain ON tags(domain);
 CREATE INDEX idx_tags_category ON tags(category);
 CREATE INDEX idx_document_tags_tag ON document_tags(tag_id);
+
+-- 概念索引
+CREATE INDEX idx_concepts_normalized ON concepts(normalized);
+CREATE INDEX idx_concepts_category ON concepts(category);
+CREATE INDEX idx_concepts_doc_count ON concepts(doc_count DESC);
+CREATE INDEX idx_document_concepts_document ON document_concepts(document_id);
+CREATE INDEX idx_document_concepts_concept ON document_concepts(concept_id);
 
 -- ============================================================
 -- 5. 函数：混合检索（关键词 + 向量）
