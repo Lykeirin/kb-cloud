@@ -769,14 +769,14 @@ async def api_ingest_text(request):
 
 async def graph_page(request):
     """知识图谱可视化页面 - GET /graph（Graphviz 服务端渲染，零前端依赖）"""
-    min_sim = request.query_params.get("min_similarity", "0.5")
+    min_sim = request.query_params.get("min_similarity", "0.65")
     try:
         sim_val = float(min_sim)
         sim_val = max(0.2, min(0.95, sim_val))
         min_sim = str(sim_val)
     except ValueError:
-        min_sim = "0.5"
-        sim_val = 0.5
+        min_sim = "0.65"
+        sim_val = 0.65
 
     html = GRAPH_PAGE_HTML
     html = html.replace("__MIN_SIM__", min_sim)
@@ -798,11 +798,11 @@ async def api_graph(request):
 
 
 async def api_graph_svg(request):
-    """Graphviz SVG 图谱 — GET /api/graph_svg?min_similarity=0.5（服务端渲染，零 JS）"""
+    """Graphviz SVG 图谱 — GET /api/graph_svg?min_similarity=0.65（服务端渲染，零 JS）"""
     try:
         import graphviz as gv
 
-        min_sim = float(request.query_params.get("min_similarity", "0.5"))
+        min_sim = float(request.query_params.get("min_similarity", "0.65"))
         min_sim = max(0.2, min(0.95, min_sim))
         data = await asyncio.get_event_loop().run_in_executor(
             None, lambda: kb.get_graph_data(min_similarity=min_sim)
@@ -812,7 +812,6 @@ async def api_graph_svg(request):
         edges = data.get("edges", [])
 
         if not nodes:
-            # 返回带提示信息的空白 SVG
             return HTMLResponse(
                 '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100" width="100%" height="300">'
                 '<rect width="400" height="100" fill="#0f172a"/>'
@@ -821,21 +820,36 @@ async def api_graph_svg(request):
                 media_type="image/svg+xml",
             )
 
-        # 构建 Graphviz 图
-        dot = gv.Digraph("KB", format="svg")
+        # 边太多时截取 top-N（按相似度降序），避免渲染超时
+        MAX_EDGES = 200
+        if len(edges) > MAX_EDGES:
+            edges = sorted(edges, key=lambda e: e["similarity"], reverse=True)[:MAX_EDGES]
+
+        # 只保留有边连接的节点（减少孤立节点）
+        connected_ids = set()
+        for e in edges:
+            connected_ids.add(e["source"])
+            connected_ids.add(e["target"])
+        # 保留所有节点（包括孤立的），但如果太多就只保留有连接的
+        if len(nodes) > 60:
+            nodes = [n for n in nodes if n["id"] in connected_ids]
+
+        # 根据节点数量选择引擎
+        # sfdp: 超快的大图力导向布局;  neato: 中等图;  dot: 小图层次布局
+        engine = "sfdp" if len(nodes) > 20 else "dot"
+
+        dot = gv.Digraph("KB", format="svg", engine=engine)
         dot.attr(
-            rankdir="LR",
             bgcolor="#0f172a",
             fontname="Helvetica",
             overlap="false",
-            splines="true",
+            splines="true" if len(nodes) <= 30 else "false",
             K="2.0",
         )
         dot.attr("node", shape="box", style="rounded,filled", fontname="Helvetica",
-                 fontsize="11", margin="0.1,0.05")
-        dot.attr("edge", fontname="Helvetica", fontsize="9")
+                 fontsize="10", margin="0.08,0.04")
+        dot.attr("edge", fontname="Helvetica", fontsize="8")
 
-        # 节点颜色
         LAW_FILL = "#1e3a5f"
         LAW_BORDER = "#3b82f6"
         WRITING_FILL = "#2d1b4e"
@@ -843,10 +857,9 @@ async def api_graph_svg(request):
 
         for node in nodes:
             nid = node["id"].replace("-", "_")[:20]
-            title = node["title"][:28]
-            tags = ", ".join(node.get("tags", [])[:3])
+            title = node["title"][:24]
+            tags = ", ".join(node.get("tags", [])[:2])
             label = f"{title}\\n{tags}" if tags else title
-            # 节点点击跳转到文档阅读页
             view_url = f"/view/{node['id']}"
 
             if node["domain"] == "law":
@@ -859,21 +872,23 @@ async def api_graph_svg(request):
                 dot.node(nid, label=label, fillcolor="#1e293b", fontcolor="#e2e8f0",
                          URL=view_url, target="_self")
 
+        # 边太多时不显示百分比标签（渲染慢）
+        show_labels = len(edges) <= 50
         for edge in edges:
             src = edge["source"].replace("-", "_")[:20]
             tgt = edge["target"].replace("-", "_")[:20]
             sim = edge["similarity"]
-            # 边颜色随相似度变化
-            alpha = int(min(sim, 1.0) * 180 + 75)
+            alpha = int(min(sim, 1.0) * 120 + 60)
             color = f"#{alpha:02x}{alpha:02x}{alpha:02x}"
-            dot.edge(src, tgt, color=color, penwidth=str(max(0.5, sim * 2.5)),
-                    label=f" {sim:.0%}", fontcolor="#64748b")
+            if show_labels:
+                dot.edge(src, tgt, color=color, penwidth=str(max(0.5, sim * 2.0)),
+                        label=f" {sim:.0%}", fontcolor="#64748b")
+            else:
+                dot.edge(src, tgt, color=color, penwidth=str(max(0.3, sim * 1.5)))
 
-        # 渲染为 SVG
         svg_bytes = dot.pipe()
         svg_str = svg_bytes.decode("utf-8")
 
-        # Graphviz 生成的 SVG 含 XML 声明和 DOCTYPE — 提取纯 SVG
         svg_start = svg_str.find("<svg")
         if svg_start >= 0:
             svg_str = svg_str[svg_start:]
@@ -924,30 +939,32 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
   <form class="controls" method="get" action="/graph">
     <label for="threshold">相似度阈值</label>
     <input type="range" id="threshold" name="min_similarity" min="20" max="95" value="__THRESHOLD_VAL__" step="5"
-           oninput="document.getElementById('val').textContent=(this.value/100).toFixed(2);this.form.submit()">
+           oninput="document.getElementById('val').textContent=(this.value/100).toFixed(2)"
+           onchange="this.form.submit()">
     <span id="val">__THRESHOLD_DISPLAY__</span>
   </form>
 </div>
-<div class="hint">💡 点击图谱节点可查看文档详情</div>
+<div class="hint">💡 点击图谱节点可查看文档详情 · 拖动滑块调整相似度阈值</div>
 <div class="graph-area" id="graphArea">
   <p style="color:#64748b">加载中...</p>
 </div>
 <script>
 async function loadGraph(){
   var area = document.getElementById('graphArea');
-  area.innerHTML = '<p style="color:#64748b">加载中...</p>';
+  area.innerHTML = '<p style="color:#64748b">渲染中...（文档较多，请耐心等待）</p>';
   try {
-    var resp = await fetch('/api/graph_svg?min_similarity=__MIN_SIM__');
+    var controller = new AbortController();
+    var timeoutId = setTimeout(function(){controller.abort();}, 90000);
+    var resp = await fetch('/api/graph_svg?min_similarity=__MIN_SIM__', {signal: controller.signal});
+    clearTimeout(timeoutId);
     if(!resp.ok) throw new Error('HTTP '+resp.status);
     var svgText = await resp.text();
-    // 内联 SVG，使节点链接可点击
     area.innerHTML = svgText;
-    // 确保所有内部链接在新窗口打开
     area.querySelectorAll('a').forEach(function(a){
       a.setAttribute('target','_self');
     });
   } catch(e) {
-    area.innerHTML = '<div class="error">图谱加载失败: '+e.message+'<br><a href="/api/graph" style="color:#60a5fa">查看原始数据</a></div>';
+    area.innerHTML = '<div class="error">图谱加载失败: '+e.message+'<br>建议调高相似度阈值减少边数量<br><a href="/api/graph" style="color:#60a5fa">查看原始数据</a></div>';
   }
 }
 loadGraph();
@@ -1001,7 +1018,7 @@ app = Starlette(
         Route("/api/upload", api_upload, methods=["POST"]),
         Route("/api/ingest_text", api_ingest_text, methods=["POST"]),
         # 静态资源（带 fallback）
-        Mount("/static", app=static_fallback, name="static") if _static_app else Route("/static/{path:path}", lambda r: JSONResponse({"error":"no static"},404)),
+        Mount("/static", app=static_fallback, name="static"),
     ],
 )
 

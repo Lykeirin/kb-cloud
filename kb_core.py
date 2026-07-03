@@ -574,3 +574,87 @@ class KnowledgeBase:
             "total_tags": tag_count,
             "breakdown": breakdown,
         }
+
+    def get_graph_data(self, min_similarity: float = 0.5) -> dict:
+        """
+        构建知识图谱数据：节点（文档）+ 边（文档间语义相似度）
+
+        节点包含文档元数据和标签，边权重 = 文档间最大 chunk 余弦相似度。
+        边仅返回相似度 >= min_similarity 的文档对。
+        """
+        # rollback any aborted transaction before we start
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Step 1: 获取所有已索引文档（节点）
+            cur.execute("""
+                SELECT d.id, d.title, d.domain, d.author, d.doc_type,
+                       d.word_count, d.summary, d.created_at
+                FROM documents d
+                WHERE d.status = 'ready'
+                ORDER BY d.created_at DESC
+            """)
+            doc_rows = cur.fetchall()
+
+            nodes = []
+            doc_ids = set()
+            for row in doc_rows:
+                doc_ids.add(str(row["id"]))
+                # 获取文档标签
+                cur.execute(
+                    "SELECT t.name, t.category FROM tags t "
+                    "JOIN document_tags dt ON t.id = dt.tag_id "
+                    "WHERE dt.document_id = %s",
+                    (row["id"],),
+                )
+                tag_rows = cur.fetchall()
+
+                nodes.append({
+                    "id": str(row["id"]),
+                    "title": row["title"],
+                    "domain": row["domain"],
+                    "author": row["author"] or "",
+                    "doc_type": row["doc_type"],
+                    "word_count": row["word_count"],
+                    "summary": row["summary"] or "",
+                    "tags": [t["name"] for t in tag_rows],
+                    "primary_tag": tag_rows[0]["name"] if tag_rows else row["domain"],
+                })
+
+            # Step 2: 批量计算文档间语义相似度（取最大 chunk 相似度作为边权重）
+            if len(doc_ids) >= 2:
+                cur.execute("""
+                    SELECT
+                        d1.id AS doc_a,
+                        d2.id AS doc_b,
+                        MAX(1.0 - (c1.embedding <=> c2.embedding)) AS similarity
+                    FROM chunks c1
+                    JOIN documents d1 ON c1.document_id = d1.id
+                    JOIN chunks c2 ON c2.document_id != c1.document_id
+                    JOIN documents d2 ON c2.document_id = d2.id
+                    WHERE d1.id < d2.id
+                    GROUP BY d1.id, d2.id
+                    HAVING MAX(1.0 - (c1.embedding <=> c2.embedding)) >= %s
+                    ORDER BY similarity DESC
+                """, (min_similarity,))
+                edge_rows = cur.fetchall()
+            else:
+                edge_rows = []
+
+            edges = []
+            for row in edge_rows:
+                edges.append({
+                    "source": str(row["doc_a"]),
+                    "target": str(row["doc_b"]),
+                    "similarity": round(float(row["similarity"]), 4),
+                })
+
+            logger.info(
+                "图谱数据: %d 节点, %d 边 (min_similarity=%.2f)",
+                len(nodes), len(edges), min_similarity,
+            )
+
+            return {"nodes": nodes, "edges": edges}
