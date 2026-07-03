@@ -1834,14 +1834,14 @@ class KnowledgeBase:
 
             # 2. 核心概念集群（doc_count >= 3）
             core_clusters = [
-                {"name": r["name"], "category": r["category"], "doc_count": r["doc_count"],
+                {"id": str(r["id"]), "name": r["name"], "category": r["category"], "doc_count": r["doc_count"],
                  "related_concepts": r["related_count"]}
                 for r in concept_map if r["doc_count"] >= 3
             ]
 
             # 3. 知识空白：仅有 1 篇文档支撑的概念
             knowledge_gaps = [
-                {"name": r["name"], "category": r["category"]}
+                {"id": str(r["id"]), "name": r["name"], "category": r["category"]}
                 for r in concept_map if r["doc_count"] == 1
             ]
 

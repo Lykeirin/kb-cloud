@@ -1262,6 +1262,17 @@ async function searchConcepts(){
 
 function switchTab(cat){loadConcepts(cat);}
 
+// 页面加载时检查 URL 搜索参数
+var urlParams = new URLSearchParams(window.location.search);
+var initialSearch = urlParams.get('search');
+if(initialSearch){
+  document.getElementById('searchInput').value = initialSearch;
+  searchConcepts();
+}else{
+  loadStats();
+  loadConcepts('all');
+}
+
 async function showDetail(id){
   try{
     var r = await fetch('/api/concept/'+id+'?related=1');
@@ -1295,9 +1306,6 @@ async function showDetail(id){
     document.getElementById('conceptList').innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
   }
 }
-
-loadStats();
-loadConcepts('all');
 </script>
 </body>
 </html>
@@ -1363,7 +1371,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .badge-low{background:rgba(100,116,139,.15);color:#94a3b8}
 .issue-message{font-size:13px;color:#cbd5e1;margin-bottom:12px}
 .issue-items{display:flex;flex-direction:column;gap:6px}
-.issue-item{padding:8px 12px;background:#0f172a;border-radius:6px;font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:8px}
+.issue-item{padding:8px 12px;background:#0f172a;border-radius:6px;font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:8px;transition:background .15s}
+.issue-item:hover{background:#1e3a5f}
 .issue-item a{color:#60a5fa;text-decoration:none}
 .issue-item a:hover{text-decoration:underline}
 .recommendations{background:#1e3a5f;border-radius:12px;padding:20px;margin-bottom:20px}
@@ -1437,7 +1446,11 @@ function renderReport(d){
           if(item.id&&item.title){
             html+='<div class="issue-item"><a href="/view/'+item.id+'">'+item.title+'</a></div>';
           }else if(item.name){
-            html+='<div class="issue-item">'+item.name+(item.doc_count?' ('+item.doc_count+'篇)':'')+'</div>';
+            if(item.id){
+              html+='<a href="/concepts?search='+encodeURIComponent(item.name)+'" style="display:block;text-decoration:none;color:inherit"><div class="issue-item">'+item.name+(item.doc_count?' ('+item.doc_count+'篇)':'')+(item.category?' ['+item.category+']':'')+'</div></a>';
+            }else{
+              html+='<div class="issue-item">'+item.name+(item.doc_count?' ('+item.doc_count+'篇)':'')+'</div>';
+            }
           }else if(item.doc_a&&item.doc_b){
             html+='<div class="issue-item">'+item.doc_a.title+' <-> '+item.doc_b.title+(item.similarity?' ('+(item.similarity*100).toFixed(0)+'%)':'')+'</div>';
           }else if(item.names){
@@ -1494,11 +1507,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .insight-item{font-size:13px;color:#cbd5e1;margin-bottom:8px;padding-left:20px;position:relative}
 .insight-item:before{content:"\2217";position:absolute;left:0;color:#60a5fa}
 .cluster-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
-.cluster-card{padding:12px;background:#0f172a;border-radius:8px;border-left:3px solid #3b82f6}
+.cluster-card{padding:12px;background:#0f172a;border-radius:8px;border-left:3px solid #3b82f6;transition:background .15s}
+.cluster-card:hover{background:#1e3a5f}
 .cluster-card .name{font-size:14px;font-weight:600;color:#e2e8f0}
 .cluster-card .meta{font-size:11px;color:#94a3b8;margin-top:4px}
 .gap-list{display:flex;flex-wrap:wrap;gap:6px}
-.gap-tag{padding:4px 10px;background:#292524;border-radius:12px;font-size:12px;color:#fbbf24}
+.gap-tag,.gap-tag:link{padding:4px 10px;background:#292524;border-radius:12px;font-size:12px;color:#fbbf24;display:inline-block;transition:background .15s;text-decoration:none}
+.gap-tag:hover{background:#3f3528;cursor:pointer}
 .co-occurrence-list{display:flex;flex-direction:column;gap:6px}
 .co-item{padding:8px 12px;background:#0f172a;border-radius:6px;font-size:13px;color:#94a3b8;display:flex;align-items:center;gap:8px}
 .co-item .pair{color:#e2e8f0;font-weight:500}
@@ -1570,14 +1585,14 @@ function renderLandscape(d){
     html+='<div class="section"><h2>核心概念集群</h2><div class="cluster-grid">';
     for(var i=0;i<d.knowledge_map.core_clusters.length;i++){
       var cc=d.knowledge_map.core_clusters[i];
-      html+='<div class="cluster-card"><div class="name">'+cc.name+'</div><div class="meta">'+cc.category+' | '+cc.doc_count+'篇 | '+cc.related_concepts+'个关联</div></div>';
+      html+='<a href="/concepts?search='+encodeURIComponent(cc.name)+'" style="text-decoration:none;color:inherit;display:block"><div class="cluster-card"><div class="name">'+cc.name+'</div><div class="meta">'+cc.category+' | '+cc.doc_count+'篇 | '+cc.related_concepts+'个关联</div></div></a>';
     }
     html+='</div></div>';
   }
   if(d.knowledge_gaps&&d.knowledge_gaps.length){
     html+='<div class="section"><h2>知识空白（仅 1 篇文档支撑）</h2><div class="gap-list">';
     for(var i=0;i<Math.min(d.knowledge_gaps.length,30);i++){
-      html+='<span class="gap-tag">'+d.knowledge_gaps[i].name+'</span>';
+      html+='<a href="/concepts?search='+encodeURIComponent(d.knowledge_gaps[i].name)+'" class="gap-tag" style="text-decoration:none">'+d.knowledge_gaps[i].name+'</a>';
     }
     html+='</div></div>';
   }
