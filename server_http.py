@@ -174,6 +174,47 @@ async def list_tools() -> list[Tool]:
                 "required": ["concept_id"],
             },
         ),
+        Tool(
+            name="kb_health_check",
+            description="知识健康检查：检测未索引文档、孤儿概念、语义邻近未关联、概念命名冲突、重复文档等 8 类问题，返回健康评分和修复建议。",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="kb_summary",
+            description="获取文档的结构化摘要（7 模块：核心论点/关键发现/研究方法/核心概念/局限性/知识关联/实践价值）。如果尚未生成，会自动生成。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "文档 UUID"},
+                    "generate": {"type": "boolean", "default": True, "description": "如果摘要不存在是否自动生成"},
+                },
+                "required": ["document_id"],
+            },
+        ),
+        Tool(
+            name="kb_landscape",
+            description="跨文献知识图景报告：概念分布地图、核心集群、知识空白、概念共现网络、增长趋势。用于文献综述和知识全景分析。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string", "enum": ["law", "writing"], "description": "限定领域（可选）"},
+                },
+            },
+        ),
+        Tool(
+            name="kb_context",
+            description='获取会话上下文记忆：返回指定会话的查询历史和上下文摘要。用于多轮对话时让 AI 记住之前聊过什么。',
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                },
+                "required": ["session_id"],
+            },
+        ),
     ]
 
 
@@ -257,7 +298,22 @@ def _run_tool(name: str, args: dict) -> dict:
             return {"error": "Concept not found"}
         # 附带相关概念
         concept["related_concepts"] = kb.get_related_concepts(args["concept_id"], limit=10)
+        # 附带证据片段
+        concept["evidence"] = kb.get_concept_evidence(args["concept_id"], limit=10)
         return {"concept": concept}
+    elif name == "kb_health_check":
+        return kb.health_check()
+    elif name == "kb_summary":
+        doc_id = args["document_id"]
+        generate = args.get("generate", True)
+        summary = kb.get_summary(doc_id)
+        if not summary and generate:
+            summary = kb.generate_summary(doc_id)
+        return {"summary": summary} if summary else {"error": "Summary not found and generation failed"}
+    elif name == "kb_landscape":
+        return kb.generate_knowledge_landscape(domain=args.get("domain"))
+    elif name == "kb_context":
+        return kb.get_session_context(args["session_id"])
     else:
         return {"error": f"Unknown tool: {name}"}
 
@@ -838,11 +894,14 @@ async def api_concept_detail(request):
     try:
         concept_id = request.path_params.get("concept_id", "")
         include_related = request.query_params.get("related", "1") == "1"
+        include_evidence = request.query_params.get("evidence", "1") == "1"
         concept = kb.get_concept(concept_id)
         if not concept:
             return JSONResponse({"error": "Concept not found"}, status_code=404)
         if include_related:
             concept["related_concepts"] = kb.get_related_concepts(concept_id, limit=10)
+        if include_evidence:
+            concept["evidence"] = kb.get_concept_evidence(concept_id, limit=10)
         return JSONResponse({"concept": concept})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -876,6 +935,136 @@ async def api_concept_stats(request):
         stats = kb.get_concept_stats()
         return JSONResponse({"stats": stats})
     except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ============================================================
+# REST API — 知识复利层（P0-P3）
+# ============================================================
+
+async def api_health_check(request):
+    """知识健康检查 — GET /api/health_check"""
+    try:
+        report = await asyncio.get_event_loop().run_in_executor(None, kb.health_check)
+        return JSONResponse(report)
+    except Exception as e:
+        log.error(f"API health_check error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_summary(request):
+    """文档结构化摘要 — GET /api/summary/{doc_id} 或 POST /api/summary"""
+    try:
+        if request.method == "POST":
+            body = await request.json()
+            doc_id = body.get("document_id", "")
+            force = body.get("force", False)
+        else:
+            doc_id = request.path_params.get("doc_id", "")
+            force = request.query_params.get("force", "0") == "1"
+
+        if not doc_id:
+            return JSONResponse({"error": "Missing document_id"}, status_code=400)
+
+        def _get_or_generate():
+            existing = kb.get_summary(doc_id)
+            if existing and not force:
+                return existing
+            return kb.generate_summary(doc_id)
+
+        summary = await asyncio.get_event_loop().run_in_executor(None, _get_or_generate)
+        if not summary:
+            return JSONResponse({"error": "Failed to generate summary"}, status_code=500)
+        return JSONResponse({"summary": summary})
+    except Exception as e:
+        log.error(f"API summary error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_knowledge_landscape(request):
+    """跨文献知识图景 — GET /api/knowledge_landscape?domain=law"""
+    try:
+        domain = request.query_params.get("domain")
+        landscape = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: kb.generate_knowledge_landscape(domain=domain)
+        )
+        return JSONResponse(landscape)
+    except Exception as e:
+        log.error(f"API landscape error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_conflicts(request):
+    """矛盾检测/列表 — GET /api/conflicts?detect=1 或 GET /api/conflicts"""
+    try:
+        detect = request.query_params.get("detect", "0") == "1"
+        resolved = request.query_params.get("resolved", "0") == "1"
+        limit = min(int(request.query_params.get("limit", "30")), 100)
+
+        if detect:
+            conflicts = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: kb.detect_conflicts(max_pairs=limit)
+            )
+            return JSONResponse({"conflicts": conflicts, "total": len(conflicts), "action": "detected"})
+        else:
+            conflicts = kb.get_conflicts(resolved=resolved, limit=limit)
+            return JSONResponse({"conflicts": conflicts, "total": len(conflicts)})
+    except Exception as e:
+        log.error(f"API conflicts error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_concept_evidence(request):
+    """概念证据积累 — GET /api/concept/{concept_id}/evidence"""
+    try:
+        concept_id = request.path_params.get("concept_id", "")
+        limit = min(int(request.query_params.get("limit", "20")), 50)
+        evidence = kb.get_concept_evidence(concept_id, limit=limit)
+        return JSONResponse({"concept_id": concept_id, "evidence": evidence, "total": len(evidence)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_operations_log(request):
+    """操作日志 — GET /api/operations?type=ingest&limit=50"""
+    try:
+        op_type = request.query_params.get("type")
+        entity_id = request.query_params.get("entity_id")
+        limit = min(int(request.query_params.get("limit", "50")), 200)
+        offset = int(request.query_params.get("offset", "0"))
+        logs = kb.get_operations_log(operation_type=op_type, entity_id=entity_id, limit=limit, offset=offset)
+        return JSONResponse({"logs": logs, "total": len(logs)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_query_history(request):
+    """查询历史/会话记忆 — GET /api/query_history?session_id=xxx"""
+    try:
+        session_id = request.query_params.get("session_id", "")
+        if not session_id:
+            return JSONResponse({"error": "Missing session_id"}, status_code=400)
+        limit = min(int(request.query_params.get("limit", "10")), 50)
+        context = kb.get_session_context(session_id, limit=limit)
+        return JSONResponse(context)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_multiperspective(request):
+    """多视角概念提取 — POST /api/multiperspective {"doc_id": "...", "perspectives": ["legal","social"]}"""
+    try:
+        body = await request.json()
+        doc_id = body.get("doc_id", "")
+        perspectives = body.get("perspectives", ["legal", "social", "technical"])
+        if not doc_id:
+            return JSONResponse({"error": "Missing doc_id"}, status_code=400)
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: kb.extract_concepts_multiperspective(doc_id, perspectives)
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        log.error(f"API multiperspective error: {e}", exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -1083,6 +1272,301 @@ async def graph_page(request):
     html = html.replace("__THRESHOLD_VAL__", str(int(sim_val * 100)))
     html = html.replace("__THRESHOLD_DISPLAY__", f"{sim_val:.2f}")
     return HTMLResponse(html)
+
+
+# ============================================================
+# Web UI — 知识健康检查页面 (/health_lint)
+# ============================================================
+
+HEALTH_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识健康检查 - KB-Cloud</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.header{padding:12px 20px;background:#1e293b;border-bottom:1px solid #334155;display:flex;align-items:center;gap:16px}
+.header h1{font-size:16px;font-weight:600}
+.header a{color:#60a5fa;text-decoration:none;font-size:13px}
+.header .nav{gap:12px;display:flex}
+.container{max-width:960px;margin:20px auto;padding:0 20px}
+.score-card{background:#1e293b;border-radius:12px;padding:24px;text-align:center;margin-bottom:20px}
+.score-card .score{font-size:48px;font-weight:700;line-height:1}
+.score-card .label{font-size:14px;color:#94a3b8;margin-top:8px}
+.score-high{color:#3fb950}
+.score-medium{color:#fbbf24}
+.score-low{color:#f85149}
+.metrics-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+.metric-card{background:#1e293b;border-radius:8px;padding:14px;text-align:center}
+.metric-card .value{font-size:24px;font-weight:700;color:#60a5fa}
+.metric-card .label{font-size:11px;color:#94a3b8;margin-top:4px}
+.issue-section{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
+.issue-section h2{font-size:15px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.issue-badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500}
+.badge-high{background:rgba(248,81,73,.15);color:#f85149}
+.badge-medium{background:rgba(251,191,36,.15);color:#fbbf24}
+.badge-low{background:rgba(100,116,139,.15);color:#94a3b8}
+.issue-message{font-size:13px;color:#cbd5e1;margin-bottom:12px}
+.issue-items{display:flex;flex-direction:column;gap:6px}
+.issue-item{padding:8px 12px;background:#0f172a;border-radius:6px;font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:8px}
+.issue-item a{color:#60a5fa;text-decoration:none}
+.issue-item a:hover{text-decoration:underline}
+.recommendations{background:#1e3a5f;border-radius:12px;padding:20px;margin-bottom:20px}
+.recommendations h2{font-size:15px;margin-bottom:12px;color:#60a5fa}
+.rec-item{font-size:13px;color:#cbd5e1;margin-bottom:8px;padding-left:20px;position:relative}
+.rec-item:before{content:"\2192";position:absolute;left:0;color:#60a5fa}
+.empty{text-align:center;padding:60px 20px;color:#64748b}
+.loading{text-align:center;padding:40px;color:#64748b}
+button.refresh{padding:6px 16px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+button.refresh:hover{background:#2563eb}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>KB-Cloud 知识健康检查</h1>
+  <div class="nav">
+    <a href="/graph">知识图谱</a>
+    <a href="/concepts">概念检索</a>
+    <a href="/landscape">知识图景</a>
+    <a href="/upload">上传文档</a>
+  </div>
+  <button class="refresh" onclick="loadHealth()" style="margin-left:auto">重新检查</button>
+</div>
+<div class="container">
+  <div id="content"><div class="loading">正在执行知识健康检查...</div></div>
+</div>
+<script>
+var severityClass={high:'badge-high',medium:'badge-medium',low:'badge-low'};
+async function loadHealth(){
+  var c=document.getElementById('content');
+  c.innerHTML='<div class="loading">正在执行知识健康检查...</div>';
+  try{
+    var r=await fetch('/api/health_check');
+    var d=await r.json();
+    renderReport(d);
+  }catch(e){
+    c.innerHTML='<div class="empty">检查失败: '+e.message+'</div>';
+  }
+}
+function renderReport(d){
+  var scoreClass=d.overall_score>=80?'score-high':d.overall_score>=60?'score-medium':'score-low';
+  var m=d.metrics||{};
+  var html='<div class="score-card"><div class="score '+scoreClass+'">'+d.overall_score+'</div><div class="label">知识健康评分</div></div>';
+  html+='<div class="metrics-grid">';
+  html+=metricCard(m.total_docs||0,'文档总数');
+  html+=metricCard(m.total_chunks||0,'文本分块');
+  html+=metricCard(m.total_concepts||0,'概念总数');
+  html+=metricCard(m.total_concept_links||0,'概念关联');
+  html+=metricCard(m.cross_doc_concepts||0,'跨文档概念');
+  html+=metricCard(m.structured_summaries||0,'结构化摘要');
+  html+=metricCard(m.unresolved_conflicts||0,'未解决矛盾');
+  html+='</div>';
+  if(d.recommendations&&d.recommendations.length){
+    html+='<div class="recommendations"><h2>修复建议</h2>';
+    for(var i=0;i<d.recommendations.length;i++){
+      html+='<div class="rec-item">'+d.recommendations[i]+'</div>';
+    }
+    html+='</div>';
+  }
+  if(d.issues&&d.issues.length){
+    for(var i=0;i<d.issues.length;i++){
+      var iss=d.issues[i];
+      var sc=severityClass[iss.severity]||'badge-low';
+      html+='<div class="issue-section">';
+      html+='<h2>'+iss.type.replace(/_/g,' ')+' <span class="issue-badge '+sc+'">'+iss.severity.toUpperCase()+'</span></h2>';
+      html+='<div class="issue-message">'+iss.message+'</div>';
+      if(iss.items&&iss.items.length){
+        html+='<div class="issue-items">';
+        for(var j=0;j<Math.min(iss.items.length,5);j++){
+          var item=iss.items[j];
+          if(item.id&&item.title){
+            html+='<div class="issue-item"><a href="/view/'+item.id+'">'+item.title+'</a></div>';
+          }else if(item.name){
+            html+='<div class="issue-item">'+item.name+(item.doc_count?' ('+item.doc_count+'篇)':'')+'</div>';
+          }else if(item.doc_a&&item.doc_b){
+            html+='<div class="issue-item">'+item.doc_a.title+' <-> '+item.doc_b.title+(item.similarity?' ('+(item.similarity*100).toFixed(0)+'%)':'')+'</div>';
+          }else if(item.names){
+            html+='<div class="issue-item">'+item.names.join(' / ')+'</div>';
+          }
+        }
+        if(iss.items.length>5){html+='<div class="issue-item" style="color:#64748b">... 还有 '+(iss.items.length-5)+' 项</div>';}
+        html+='</div>';
+      }
+      html+='</div>';
+    }
+  }else{
+    html+='<div class="issue-section" style="text-align:center;color:#3fb950;padding:40px">所有检查项通过，知识库状态良好</div>';
+  }
+  document.getElementById('content').innerHTML=html;
+}
+function metricCard(val,label){
+  return '<div class="metric-card"><div class="value">'+val+'</div><div class="label">'+label+'</div></div>';
+}
+loadHealth();
+</script>
+</body>
+</html>
+"""
+
+async def health_lint_page(request):
+    """知识健康检查页面 — GET /health_lint"""
+    return HTMLResponse(HEALTH_PAGE_HTML)
+
+
+# ============================================================
+# Web UI — 知识图景页面 (/landscape)
+# ============================================================
+
+LANDSCAPE_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识图景 - KB-Cloud</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.header{padding:12px 20px;background:#1e293b;border-bottom:1px solid #334155;display:flex;align-items:center;gap:16px}
+.header h1{font-size:16px;font-weight:600}
+.header a{color:#60a5fa;text-decoration:none;font-size:13px}
+.header .nav{gap:12px;display:flex}
+.header select{padding:4px 10px;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:13px}
+.container{max-width:960px;margin:20px auto;padding:0 20px}
+.section{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
+.section h2{font-size:15px;margin-bottom:12px;color:#60a5fa}
+.insights{background:#1e3a5f;border-radius:12px;padding:20px;margin-bottom:16px}
+.insights h2{font-size:15px;margin-bottom:12px;color:#60a5fa}
+.insight-item{font-size:13px;color:#cbd5e1;margin-bottom:8px;padding-left:20px;position:relative}
+.insight-item:before{content:"\2217";position:absolute;left:0;color:#60a5fa}
+.cluster-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.cluster-card{padding:12px;background:#0f172a;border-radius:8px;border-left:3px solid #3b82f6}
+.cluster-card .name{font-size:14px;font-weight:600;color:#e2e8f0}
+.cluster-card .meta{font-size:11px;color:#94a3b8;margin-top:4px}
+.gap-list{display:flex;flex-wrap:wrap;gap:6px}
+.gap-tag{padding:4px 10px;background:#292524;border-radius:12px;font-size:12px;color:#fbbf24}
+.co-occurrence-list{display:flex;flex-direction:column;gap:6px}
+.co-item{padding:8px 12px;background:#0f172a;border-radius:6px;font-size:13px;color:#94a3b8;display:flex;align-items:center;gap:8px}
+.co-item .pair{color:#e2e8f0;font-weight:500}
+.co-item .count{background:#1e3a5f;color:#60a5fa;padding:2px 8px;border-radius:10px;font-size:11px}
+.trend-table{width:100%;border-collapse:collapse}
+.trend-table th,.trend-table td{padding:8px 12px;text-align:left;border-bottom:1px solid #334155;font-size:13px}
+.trend-table th{color:#94a3b8;font-weight:500}
+.trend-table td{color:#e2e8f0}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-bottom:16px}
+.summary-card{background:#1e293b;border-radius:8px;padding:14px;text-align:center}
+.summary-card .val{font-size:24px;font-weight:700;color:#60a5fa}
+.summary-card .lbl{font-size:11px;color:#94a3b8;margin-top:4px}
+.loading{text-align:center;padding:40px;color:#64748b}
+.empty{text-align:center;padding:40px;color:#64748b}
+.dist-row{display:flex;align-items:center;gap:12px;padding:6px 0;font-size:13px}
+.dist-bar{flex:1;height:8px;background:#0f172a;border-radius:4px;overflow:hidden}
+.dist-fill{height:100%;background:#3b82f6;border-radius:4px}
+.dist-label{min-width:120px;color:#94a3b8}
+.dist-count{min-width:40px;text-align:right;color:#60a5fa;font-weight:600}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>KB-Cloud 知识图景</h1>
+  <div class="nav">
+    <a href="/graph">知识图谱</a>
+    <a href="/concepts">概念检索</a>
+    <a href="/health_lint">健康检查</a>
+    <a href="/upload">上传文档</a>
+  </div>
+  <select id="domainFilter" onchange="loadLandscape()">
+    <option value="">全部领域</option>
+    <option value="law">法学</option>
+    <option value="writing">创作</option>
+  </select>
+</div>
+<div class="container">
+  <div id="content"><div class="loading">正在生成知识图景报告...</div></div>
+</div>
+<script>
+async function loadLandscape(){
+  var c=document.getElementById('content');
+  var domain=document.getElementById('domainFilter').value;
+  c.innerHTML='<div class="loading">正在生成知识图景报告...</div>';
+  try{
+    var url='/api/knowledge_landscape';
+    if(domain)url+='?domain='+domain;
+    var r=await fetch(url);
+    var d=await r.json();
+    renderLandscape(d);
+  }catch(e){
+    c.innerHTML='<div class="empty">加载失败: '+e.message+'</div>';
+  }
+}
+function renderLandscape(d){
+  var s=d.summary||{};
+  var html='<div class="summary-grid">';
+  html+=sumCard(s.total_concepts||0,'概念总数');
+  html+=sumCard(s.core_clusters||0,'核心集群');
+  html+=sumCard(s.knowledge_gaps||0,'知识空白');
+  html+=sumCard(s.co_occurrence_pairs||0,'概念共现对');
+  html+='</div>';
+  if(d.insights&&d.insights.length){
+    html+='<div class="insights"><h2>AI 洞察</h2>';
+    for(var i=0;i<d.insights.length;i++){html+='<div class="insight-item">'+d.insights[i]+'</div>';}
+    html+='</div>';
+  }
+  if(d.knowledge_map&&d.knowledge_map.core_clusters&&d.knowledge_map.core_clusters.length){
+    html+='<div class="section"><h2>核心概念集群</h2><div class="cluster-grid">';
+    for(var i=0;i<d.knowledge_map.core_clusters.length;i++){
+      var cc=d.knowledge_map.core_clusters[i];
+      html+='<div class="cluster-card"><div class="name">'+cc.name+'</div><div class="meta">'+cc.category+' | '+cc.doc_count+'篇 | '+cc.related_concepts+'个关联</div></div>';
+    }
+    html+='</div></div>';
+  }
+  if(d.knowledge_gaps&&d.knowledge_gaps.length){
+    html+='<div class="section"><h2>知识空白（仅 1 篇文档支撑）</h2><div class="gap-list">';
+    for(var i=0;i<Math.min(d.knowledge_gaps.length,30);i++){
+      html+='<span class="gap-tag">'+d.knowledge_gaps[i].name+'</span>';
+    }
+    html+='</div></div>';
+  }
+  if(d.discipline_distribution&&d.discipline_distribution.length){
+    var maxCnt=0;
+    for(var i=0;i<d.discipline_distribution.length;i++){if(d.discipline_distribution[i].count>maxCnt)maxCnt=d.discipline_distribution[i].count;}
+    html+='<div class="section"><h2>学科分布</h2>';
+    for(var i=0;i<d.discipline_distribution.length;i++){
+      var dd=d.discipline_distribution[i];
+      var pct=maxCnt>0?(dd.count/maxCnt*100):0;
+      html+='<div class="dist-row"><span class="dist-label">'+dd.domain+' / '+dd.doc_type+'</span><div class="dist-bar"><div class="dist-fill" style="width:'+pct+'%"></div></div><span class="dist-count">'+dd.count+'</span></div>';
+    }
+    html+='</div>';
+  }
+  if(d.concept_co_occurrences&&d.concept_co_occurrences.length){
+    html+='<div class="section"><h2>概念共现网络 (Top 20)</h2><div class="co-occurrence-list">';
+    for(var i=0;i<d.concept_co_occurrences.length;i++){
+      var co=d.concept_co_occurrences[i];
+      html+='<div class="co-item"><span class="pair">'+co.concept_a+' <-> '+co.concept_b+'</span><span class="count">'+co.co_occurrence+'</span></div>';
+    }
+    html+='</div></div>';
+  }
+  if(d.growth_trends&&d.growth_trends.length){
+    html+='<div class="section"><h2>增长趋势</h2><table class="trend-table"><tr><th>年份</th><th>文档数</th><th>概念数</th></tr>';
+    for(var i=0;i<d.growth_trends.length;i++){
+      var t=d.growth_trends[i];
+      html+='<tr><td>'+(t.year||'未知')+'</td><td>'+t.docs+'</td><td>'+t.concepts+'</td></tr>';
+    }
+    html+='</table></div>';
+  }
+  document.getElementById('content').innerHTML=html;
+}
+function sumCard(val,label){return '<div class="summary-card"><div class="val">'+val+'</div><div class="lbl">'+label+'</div></div>';}
+loadLandscape();
+</script>
+</body>
+</html>
+"""
+
+async def landscape_page(request):
+    """知识图景页面 — GET /landscape"""
+    return HTMLResponse(LANDSCAPE_PAGE_HTML)
 
 
 async def api_graph(request):
@@ -1309,6 +1793,10 @@ app = Starlette(
         Route("/graph", graph_page),
         # 概念浏览页面
         Route("/concepts", concepts_page),
+        # 知识健康检查页面
+        Route("/health_lint", health_lint_page),
+        # 知识图景页面
+        Route("/landscape", landscape_page),
         # REST API（供 OpenWebUI 等外部应用）
         Route("/api/search", api_search, methods=["GET", "POST"]),
         Route("/api/semantic_search", api_semantic_search, methods=["POST"]),
@@ -1324,7 +1812,17 @@ app = Starlette(
         Route("/api/concepts/search", api_concepts_search, methods=["GET"]),
         Route("/api/concept/stats", api_concept_stats, methods=["GET"]),
         Route("/api/concept/extract", api_concept_extract, methods=["POST"]),
+        Route("/api/concept/{concept_id:str}/evidence", api_concept_evidence, methods=["GET"]),
         Route("/api/concept/{concept_id:str}", api_concept_detail, methods=["GET"]),
+        # 知识复利层 API（P0-P3）
+        Route("/api/health_check", api_health_check, methods=["GET"]),
+        Route("/api/summary/{doc_id:str}", api_summary, methods=["GET"]),
+        Route("/api/summary", api_summary, methods=["POST"]),
+        Route("/api/knowledge_landscape", api_knowledge_landscape, methods=["GET"]),
+        Route("/api/conflicts", api_conflicts, methods=["GET"]),
+        Route("/api/operations", api_operations_log, methods=["GET"]),
+        Route("/api/query_history", api_query_history, methods=["GET"]),
+        Route("/api/multiperspective", api_multiperspective, methods=["POST"]),
         # 静态资源（带 fallback）
         Mount("/static", app=static_fallback, name="static"),
     ],

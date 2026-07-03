@@ -507,6 +507,36 @@ def process_file(filepath: Path, kb: KnowledgeBase, db_tags: set, book_title: st
         except Exception as e:
             log.warning(f"  ⚠ 概念抽取失败（不影响入库）: {e}")
 
+        # 4.6 生成结构化摘要（P1）
+        log.info(f"  [4.6/5] 生成结构化摘要...")
+        try:
+            summary = kb.generate_summary(doc_id)
+            if summary and not summary.get("error"):
+                log.info(f"       摘要已生成: {summary.get('core_argument', '')[:60]}...")
+            else:
+                log.info(f"       ⚠ 摘要生成跳过")
+        except Exception as e:
+            log.warning(f"  ⚠ 摘要生成失败（不影响入库）: {e}")
+
+        # 4.7 记录操作日志（P0）
+        try:
+            kb.log_operation(
+                operation_type="ingest",
+                entity_type="document",
+                entity_id=doc_id,
+                entity_title=title,
+                details={
+                    "domain": domain,
+                    "doc_type": doc_type,
+                    "char_count": len(text),
+                    "tags": tags,
+                    "concepts_extracted": len(concepts) if 'concepts' in dir() else 0,
+                },
+                operator="watcher",
+            )
+        except Exception:
+            pass
+
         # 5. 归档
         log.info(f"  [5/5] 归档到 {ARCHIVE_DIR}/")
         dest = ARCHIVE_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"

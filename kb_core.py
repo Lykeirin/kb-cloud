@@ -1072,3 +1072,1058 @@ class KnowledgeBase:
                 logger.error(f"概念抽取失败 doc={doc_id[:8]}: {e}")
 
         return {"processed": len(rows), "total_concepts": total_concepts}
+
+    # ============================================================
+    # P0: 操作审计日志 + 知识健康检查
+    # ============================================================
+
+    def log_operation(
+        self,
+        operation_type: str,
+        entity_type: str = None,
+        entity_id: str = None,
+        entity_title: str = None,
+        details: dict = None,
+        operator: str = "system",
+    ) -> int:
+        """记录操作日志（append-only，不可修改）"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO kb_operations_log
+                    (operation_type, entity_type, entity_id, entity_title, details, operator)
+                    VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                    (
+                        operation_type,
+                        entity_type,
+                        entity_id,
+                        entity_title,
+                        json.dumps(details or {}, ensure_ascii=False),
+                        operator,
+                    ),
+                )
+                log_id = cur.fetchone()[0]
+                self.conn.commit()
+                return log_id
+        except Exception as e:
+            logger.warning(f"log_operation 失败（不影响主流程）: {e}")
+            self.conn.rollback()
+            return 0
+
+    def get_operations_log(
+        self,
+        operation_type: str = None,
+        entity_id: str = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """查询操作日志"""
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            conditions = []
+            params = []
+            if operation_type:
+                conditions.append("operation_type = %s")
+                params.append(operation_type)
+            if entity_id:
+                conditions.append("entity_id = %s")
+                params.append(entity_id)
+            where = " AND ".join(conditions) if conditions else "TRUE"
+            params.extend([limit, offset])
+            cur.execute(
+                f"""SELECT id, operation_type, entity_type, entity_id, entity_title,
+                          details, operator, created_at
+                FROM kb_operations_log
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s""",
+                params,
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": r["id"],
+                    "operation_type": r["operation_type"],
+                    "entity_type": r["entity_type"],
+                    "entity_id": str(r["entity_id"]) if r["entity_id"] else None,
+                    "entity_title": r["entity_title"],
+                    "details": r["details"],
+                    "operator": r["operator"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                }
+                for r in rows
+            ]
+
+    def health_check(self) -> dict:
+        """
+        知识健康检查（纯 SQL，零 LLM）。
+
+        检查 8 类问题：
+        1. 未索引文档（有文档但无 chunks）
+        2. 未提取概念的文档
+        3. 无摘要文档
+        4. 孤儿概念（仅出现在 1 篇文档中）
+        5. 语义邻近但未关联（向量相似度高但无共同概念）
+        6. 概念命名冲突（normalized 相同但 name 不同）
+        7. 标签覆盖率（有多少文档没有任何标签）
+        8. 重复/近似文档检测
+        """
+        report = {
+            "overall_score": 100,
+            "issues": [],
+            "metrics": {},
+            "recommendations": [],
+        }
+
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 基础指标
+            cur.execute("SELECT * FROM health_metrics")
+            metrics = cur.fetchone()
+            report["metrics"] = dict(metrics) if metrics else {}
+
+            # 1. 未索引文档
+            cur.execute("""
+                SELECT d.id, d.title, d.domain, d.created_at
+                FROM documents d
+                WHERE d.status = 'ready'
+                AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id)
+                ORDER BY d.created_at DESC LIMIT 20
+            """)
+            unindexed = cur.fetchall()
+            if unindexed:
+                report["issues"].append({
+                    "type": "unindexed_docs",
+                    "severity": "high",
+                    "count": metrics.get("unindexed_docs", len(unindexed)),
+                    "items": [{"id": str(r["id"]), "title": r["title"], "domain": r["domain"]} for r in unindexed],
+                    "message": f"{metrics.get('unindexed_docs', len(unindexed))} 篇文档未建立语义索引，无法被语义搜索命中",
+                })
+                report["overall_score"] -= 15
+
+            # 2. 未提取概念的文档
+            cur.execute("""
+                SELECT d.id, d.title, d.domain
+                FROM documents d
+                WHERE d.status = 'ready'
+                AND NOT EXISTS (SELECT 1 FROM document_concepts dc WHERE dc.document_id = d.id)
+                ORDER BY d.created_at DESC LIMIT 20
+            """)
+            no_concepts = cur.fetchall()
+            if no_concepts:
+                report["issues"].append({
+                    "type": "docs_without_concepts",
+                    "severity": "medium",
+                    "count": metrics.get("docs_without_concepts", len(no_concepts)),
+                    "items": [{"id": str(r["id"]), "title": r["title"]} for r in no_concepts],
+                    "message": f"{metrics.get('docs_without_concepts', len(no_concepts))} 篇文档未提取概念，无法参与知识复利",
+                })
+                report["overall_score"] -= 10
+
+            # 3. 无摘要文档
+            cur.execute("""
+                SELECT d.id, d.title
+                FROM documents d
+                WHERE d.status = 'ready'
+                AND (d.summary IS NULL OR d.summary = '')
+                LIMIT 20
+            """)
+            no_summary = cur.fetchall()
+            if no_summary:
+                report["issues"].append({
+                    "type": "docs_without_summary",
+                    "severity": "low",
+                    "count": metrics.get("docs_without_summary", len(no_summary)),
+                    "items": [{"id": str(r["id"]), "title": r["title"]} for r in no_summary],
+                    "message": f"{metrics.get('docs_without_summary', len(no_summary))} 篇文档无摘要",
+                })
+                report["overall_score"] -= 5
+
+            # 4. 孤儿概念（doc_count = 1）
+            cur.execute("""
+                SELECT id, name, category
+                FROM concepts WHERE doc_count = 1
+                ORDER BY created_at DESC LIMIT 30
+            """)
+            orphans = cur.fetchall()
+            if orphans:
+                report["issues"].append({
+                    "type": "orphan_concepts",
+                    "severity": "low",
+                    "count": metrics.get("orphan_concepts", len(orphans)),
+                    "items": [{"id": str(r["id"]), "name": r["name"], "category": r["category"]} for r in orphans[:10]],
+                    "message": f"{metrics.get('orphan_concepts', len(orphans))} 个概念仅出现在 1 篇文档中（孤儿概念），知识复利价值低",
+                })
+                report["overall_score"] -= 3
+
+            # 5. 语义邻近但未关联
+            cur.execute("""
+                SELECT d1.id AS doc_a_id, d1.title AS doc_a_title,
+                       d2.id AS doc_b_id, d2.title AS doc_b_title,
+                       MAX(1.0 - (c1.embedding <=> c2.embedding)) AS similarity
+                FROM chunks c1
+                JOIN documents d1 ON c1.document_id = d1.id
+                JOIN chunks c2 ON c2.document_id != c1.document_id
+                JOIN documents d2 ON c2.document_id = d2.id
+                WHERE d1.id < d2.id
+                GROUP BY d1.id, d1.title, d2.id, d2.title
+                HAVING MAX(1.0 - (c1.embedding <=> c2.embedding)) >= 0.75
+                AND NOT EXISTS (
+                    SELECT 1 FROM document_concepts dc1
+                    JOIN document_concepts dc2 ON dc1.concept_id = dc2.concept_id
+                    WHERE dc1.document_id = d1.id AND dc2.document_id = d2.id
+                )
+                ORDER BY similarity DESC LIMIT 10
+            """)
+            unlinked = cur.fetchall()
+            if unlinked:
+                report["issues"].append({
+                    "type": "semantic_neighbors_unlinked",
+                    "severity": "medium",
+                    "count": len(unlinked),
+                    "items": [
+                        {
+                            "doc_a": {"id": str(r["doc_a_id"]), "title": r["doc_a_title"]},
+                            "doc_b": {"id": str(r["doc_b_id"]), "title": r["doc_b_title"]},
+                            "similarity": round(float(r["similarity"]), 3),
+                        }
+                        for r in unlinked
+                    ],
+                    "message": f"{len(unlinked)} 对文档语义相似度 >0.75 但无共同概念，可能需要补充概念提取",
+                })
+                report["overall_score"] -= 8
+
+            # 6. 概念命名冲突（normalized 相同但 name 不同）
+            cur.execute("""
+                SELECT normalized, array_agg(name) AS names, array_agg(id) AS ids
+                FROM concepts
+                GROUP BY normalized
+                HAVING COUNT(DISTINCT name) > 1
+                LIMIT 10
+            """)
+            conflicts = cur.fetchall()
+            if conflicts:
+                report["issues"].append({
+                    "type": "concept_naming_conflict",
+                    "severity": "medium",
+                    "count": len(conflicts),
+                    "items": [
+                        {"normalized": r["normalized"], "names": r["names"], "ids": [str(i) for i in r["ids"]]}
+                        for r in conflicts
+                    ],
+                    "message": f"{len(conflicts)} 组概念归一化后相同但显示名不同，可能导致重复",
+                })
+                report["overall_score"] -= 5
+
+            # 7. 标签覆盖率
+            cur.execute("""
+                SELECT COUNT(*) FROM documents d
+                WHERE d.status = 'ready'
+                AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.document_id = d.id)
+            """)
+            untagged_count = cur.fetchone()["count"]
+            cur.execute("SELECT COUNT(*) FROM documents WHERE status = 'ready'")
+            total_docs = cur.fetchone()["count"]
+            if total_docs > 0 and untagged_count > 0:
+                coverage = round((1 - untagged_count / total_docs) * 100, 1)
+                report["issues"].append({
+                    "type": "low_tag_coverage",
+                    "severity": "low",
+                    "count": untagged_count,
+                    "coverage_percent": coverage,
+                    "message": f"{untagged_count} 篇文档无任何标签（覆盖率 {coverage}%）",
+                })
+                if coverage < 80:
+                    report["overall_score"] -= 5
+
+            # 8. 重复/近似文档检测（标题相似度 > 80%）
+            cur.execute("""
+                SELECT d1.id AS id_a, d1.title AS title_a,
+                       d2.id AS id_b, d2.title AS title_b,
+                       similarity(d1.title, d2.title) AS title_sim
+                FROM documents d1
+                JOIN documents d2 ON d1.id < d2.id
+                WHERE d1.status = 'ready' AND d2.status = 'ready'
+                AND similarity(d1.title, d2.title) > 0.6
+                ORDER BY title_sim DESC LIMIT 10
+            """)
+            duplicates = cur.fetchall()
+            if duplicates:
+                report["issues"].append({
+                    "type": "potential_duplicates",
+                    "severity": "medium",
+                    "count": len(duplicates),
+                    "items": [
+                        {
+                            "doc_a": {"id": str(r["id_a"]), "title": r["title_a"]},
+                            "doc_b": {"id": str(r["id_b"]), "title": r["title_b"]},
+                            "title_similarity": round(float(r["title_sim"]), 3),
+                        }
+                        for r in duplicates
+                    ],
+                    "message": f"{len(duplicates)} 对文档标题高度相似，可能存在重复入库",
+                })
+                report["overall_score"] -= 5
+
+        # 生成建议
+        report["overall_score"] = max(0, report["overall_score"])
+        if metrics.get("unindexed_docs", 0) > 0:
+            report["recommendations"].append("对未索引文档执行 kb_index 建立语义索引")
+        if metrics.get("docs_without_concepts", 0) > 0:
+            report["recommendations"].append("对未提取概念的文档调用 /api/concept/extract")
+        if metrics.get("orphan_concepts", 0) > metrics.get("total_concepts", 1) * 0.5:
+            report["recommendations"].append("孤儿概念过多，建议增加同主题文档入库以激活知识复利")
+        if metrics.get("docs_without_summary", 0) > 0:
+            report["recommendations"].append("对无摘要文档生成结构化摘要")
+
+        # 记录健康检查操作
+        self.log_operation(
+            operation_type="health_check",
+            entity_type="system",
+            details={
+                "score": report["overall_score"],
+                "issue_count": len(report["issues"]),
+            },
+            operator="api",
+        )
+
+        return report
+
+    # ============================================================
+    # P1: 单文档结构化摘要
+    # ============================================================
+
+    def generate_summary(self, doc_id: str) -> dict:
+        """
+        为文档生成 7-module 结构化摘要。
+
+        借鉴 NotebookLM 的低幻觉设计：
+        - 所有内容严格基于原文，不做推断
+        - 每个模块都标注来源位置
+        - 未覆盖的内容明确标注"原文未涉及"
+
+        7 个模块：
+        1. core_argument — 核心论点（一句话）
+        2. key_findings — 关键发现（3-5 条）
+        3. methodology — 研究方法/论证路径
+        4. key_concepts — 核心概念列表
+        5. limitations — 局限性与不足
+        6. connections — 与既有知识的关联
+        7. practical_value — 实践价值
+        """
+        # 获取文档内容
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT content, title, domain, doc_type FROM documents WHERE id = %s", (doc_id,))
+            row = cur.fetchone()
+            if not row or not row[0]:
+                return {"error": "document not found or empty"}
+            content = row[0]
+            title = row[1]
+            domain = row[2]
+            doc_type = row[3]
+
+        text = content[:6000]  # 取前 6000 字做摘要
+
+        # 获取文档已有概念
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT c.name, c.category FROM concepts c
+                JOIN document_concepts dc ON c.id = dc.concept_id
+                WHERE dc.document_id = %s ORDER BY dc.relevance DESC LIMIT 10""",
+                (doc_id,),
+            )
+            doc_concepts = [{"name": r[0], "category": r[1]} for r in cur.fetchall()]
+
+        # 基于文本统计特征的结构化摘要（纯规则，零 LLM）
+        # 1. 核心论点：取摘要字段或正文前 200 字
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT summary FROM documents WHERE id = %s", (doc_id,))
+            existing_summary = cur.fetchone()[0] or ""
+
+        core_argument = existing_summary[:200] if existing_summary else text[:200].replace("\n", " ").strip()
+
+        # 2. 关键发现：从概念和文本中提取
+        key_findings = []
+        # 取文档中最相关的概念作为关键发现
+        for c in doc_concepts[:5]:
+            key_findings.append(f"涉及{c['category']}：{c['name']}")
+
+        # 从文本中提取带序号的要点
+        import re as _re
+        numbered = _re.findall(r'[（(][\d一二三四五六七八九十]+[)）]\s*([^\n]{10,80})', text[:3000])
+        for item in numbered[:5]:
+            if item not in key_findings:
+                key_findings.append(item.strip())
+
+        if not key_findings:
+            # 取前 3 个段落的首句
+            paragraphs = [p.strip() for p in text.split("\n") if len(p.strip()) > 50]
+            for p in paragraphs[:3]:
+                first_sentence = _re.split(r'[。！？]', p)[0]
+                if first_sentence and len(first_sentence) > 10:
+                    key_findings.append(first_sentence.strip() + "。")
+
+        # 3. 研究方法：检测方法论关键词
+        method_keywords = {
+            "实证研究": ["实证", "数据", "样本", "问卷", "统计", "回归", "量化"],
+            "比较法研究": ["比较", "域外", "各国", "对比", "英美", "大陆法"],
+            "案例分析": ["案例", "判决", "裁判", "法院", "案件"],
+            "规范分析": ["规范", "应然", "价值", "理念", "原则"],
+            "文献研究": ["文献", "综述", "学说", "理论"],
+        }
+        detected_methods = []
+        for method, keywords in method_keywords.items():
+            if any(kw in text[:3000] for kw in keywords):
+                detected_methods.append(method)
+
+        methodology = "、".join(detected_methods) if detected_methods else "原文未明确标注研究方法"
+
+        # 4. 核心概念
+        key_concepts = [c["name"] for c in doc_concepts[:8]]
+
+        # 5. 局限性：检测局限性表述
+        limitation_patterns = [
+            r"不足之处[，,：:](.{10,100})",
+            r"局限性[，,：:](.{10,100})",
+            r"存在.*?问题[，,：:](.{10,80})",
+            r"尚待.*?研究",
+            r"未来.*?方向",
+        ]
+        limitations = "原文未明确讨论局限性"
+        for pat in limitation_patterns:
+            match = _re.search(pat, text)
+            if match:
+                limitations = match.group(0)[:200]
+                break
+
+        # 6. 与既有知识的关联：查找同域高相似度文档
+        connections = ""
+        try:
+            cur.execute("""
+                SELECT d2.title, MAX(1.0 - (c1.embedding <=> c2.embedding)) AS sim
+                FROM chunks c1
+                JOIN documents d1 ON c1.document_id = d1.id
+                JOIN chunks c2 ON c2.document_id != d1.id
+                JOIN documents d2 ON c2.document_id = d2.id
+                WHERE d1.id = %s AND d2.status = 'ready' AND d2.domain = %s
+                GROUP BY d2.title
+                ORDER BY sim DESC LIMIT 3
+            """, (doc_id, domain))
+            related = cur.fetchall()
+            if related:
+                connections = "；".join([f"《{r[0]}》(相似度 {r[1]:.1%})" for r in related])
+        except Exception:
+            pass
+        if not connections:
+            connections = "未找到高相似度关联文档"
+
+        # 7. 实践价值
+        practical_keywords = {
+            "立法建议": ["立法", "制度完善", "法律修改", "条文"],
+            "司法适用": ["司法", "裁判", "适用", "审判"],
+            "学术贡献": ["理论创新", "学说", "新视角", "新框架"],
+            "社会实践": ["实践", "应用", "社会", "治理"],
+        }
+        practical_value = []
+        for value_type, keywords in practical_keywords.items():
+            if any(kw in text[:4000] for kw in keywords):
+                practical_value.append(value_type)
+        practical_value = "、".join(practical_value) if practical_value else "原文未明确讨论实践价值"
+
+        # 组装完整 Markdown 摘要
+        raw_summary = f"""## 文档摘要：{title}
+
+### 核心论点
+{core_argument}
+
+### 关键发现
+{chr(10).join(f'- {f}' for f in key_findings)}
+
+### 研究方法
+{methodology}
+
+### 核心概念
+{', '.join(key_concepts) if key_concepts else '无'}
+
+### 局限性
+{limitations}
+
+### 知识关联
+{connections}
+
+### 实践价值
+{practical_value}
+"""
+
+        # 存入数据库
+        summary_data = {
+            "core_argument": core_argument,
+            "key_findings": key_findings,
+            "methodology": methodology,
+            "key_concepts": key_concepts,
+            "limitations": limitations,
+            "connections": connections,
+            "practical_value": practical_value,
+            "raw_summary": raw_summary,
+            "model_used": "rule-based-v1",
+        }
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO document_summaries
+                (document_id, summary_type, core_argument, key_findings, methodology,
+                 key_concepts, limitations, connections, practical_value, raw_summary, model_used)
+                VALUES (%s, 'structured', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (document_id, summary_type) DO UPDATE
+                SET core_argument = EXCLUDED.core_argument,
+                    key_findings = EXCLUDED.key_findings,
+                    methodology = EXCLUDED.methodology,
+                    key_concepts = EXCLUDED.key_concepts,
+                    limitations = EXCLUDED.limitations,
+                    connections = EXCLUDED.connections,
+                    practical_value = EXCLUDED.practical_value,
+                    raw_summary = EXCLUDED.raw_summary,
+                    model_used = EXCLUDED.model_used,
+                    updated_at = NOW()
+                RETURNING id""",
+                (
+                    doc_id,
+                    summary_data["core_argument"],
+                    summary_data["key_findings"],
+                    summary_data["methodology"],
+                    summary_data["key_concepts"],
+                    summary_data["limitations"],
+                    summary_data["connections"],
+                    summary_data["practical_value"],
+                    summary_data["raw_summary"],
+                    summary_data["model_used"],
+                ),
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+
+        self.log_operation(
+            operation_type="summary",
+            entity_type="document",
+            entity_id=doc_id,
+            entity_title=title,
+            details={"summary_type": "structured"},
+            operator="api",
+        )
+
+        logger.info(f"结构化摘要已生成: doc={doc_id[:8]}..., title={title[:30]}")
+        return {"id": str(row[0]), "document_id": doc_id, **summary_data}
+
+    def get_summary(self, doc_id: str) -> Optional[dict]:
+        """获取文档的结构化摘要"""
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT * FROM document_summaries WHERE document_id = %s AND summary_type = 'structured'""",
+                (doc_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": str(row["id"]),
+                "document_id": str(row["document_id"]),
+                "core_argument": row["core_argument"],
+                "key_findings": row["key_findings"],
+                "methodology": row["methodology"],
+                "key_concepts": row["key_concepts"],
+                "limitations": row["limitations"],
+                "connections": row["connections"],
+                "practical_value": row["practical_value"],
+                "raw_summary": row["raw_summary"],
+                "model_used": row["model_used"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            }
+
+    def get_concept_evidence(self, concept_id: str, limit: int = 20) -> list[dict]:
+        """
+        获取概念在各文档中的证据片段（概念证据积累视图）。
+
+        从 concept_evidence 视图读取，返回每个文档中包含该概念的上下文片段。
+        """
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT * FROM concept_evidence WHERE concept_id = %s LIMIT %s""",
+                (concept_id, limit),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "document_id": str(r["document_id"]),
+                    "document_title": r["document_title"],
+                    "author": r["author"],
+                    "domain": r["domain"],
+                    "relevance": float(r["relevance"]),
+                    "perspective": r["perspective"],
+                    "evidence_snippet": r["evidence_snippet"],
+                }
+                for r in rows
+            ]
+
+    # ============================================================
+    # P2: 跨文献知识图景 + 矛盾检测
+    # ============================================================
+
+    def detect_conflicts(self, max_pairs: int = 20) -> list[dict]:
+        """
+        矛盾检测：通过语义比较发现同一概念在不同文档中的冲突表述。
+
+        策略：
+        1. 找出 doc_count >= 2 的概念（跨文档概念）
+        2. 对每对文档，提取包含该概念的上下文片段
+        3. 用向量相似度比较上下文片段，相似度低但讨论同一概念 = 潜在矛盾
+        4. 结果存入 concept_conflicts 表
+        """
+        conflicts_found = []
+
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 获取跨文档概念
+            cur.execute("""
+                SELECT c.id, c.name, c.category, c.doc_count
+                FROM concepts c
+                WHERE c.doc_count >= 2
+                ORDER BY c.doc_count DESC
+                LIMIT 50
+            """)
+            cross_doc_concepts = cur.fetchall()
+
+            for concept in cross_doc_concepts[:30]:  # 限制处理量
+                # 获取该概念在各文档中的证据片段
+                cur.execute(
+                    """SELECT * FROM concept_evidence WHERE concept_id = %s LIMIT 10""",
+                    (concept["id"],),
+                )
+                evidences = cur.fetchall()
+
+                if len(evidences) < 2:
+                    continue
+
+                # 对比每对证据片段
+                for i in range(len(evidences)):
+                    for j in range(i + 1, len(evidences)):
+                        ev_a = evidences[i]
+                        ev_b = evidences[j]
+
+                        snippet_a = ev_a["evidence_snippet"] or ""
+                        snippet_b = ev_b["evidence_snippet"] or ""
+
+                        if len(snippet_a) < 20 or len(snippet_b) < 20:
+                            continue
+
+                        # 用概念 embedding 做相似度比较（简化版）
+                        # 如果两段证据讨论同一概念但表述差异大，可能是矛盾
+                        # 这里用简单的文本重叠度作为近似
+                        words_a = set(snippet_a)
+                        words_b = set(snippet_b)
+                        if len(words_a) == 0 or len(words_b) == 0:
+                            continue
+                        overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
+
+                        # 重叠度低 = 可能矛盾
+                        if overlap < 0.3:
+                            conflict_id = str(uuid.uuid4())
+                            cur.execute(
+                                """INSERT INTO concept_conflicts
+                                (id, concept_id, doc_a_id, doc_b_id, conflict_type,
+                                 description, evidence_a, evidence_b, severity, detected_by)
+                                VALUES (%s, %s, %s, %s, 'definition',
+                                        %s, %s, %s, 'medium', 'semantic')
+                                ON CONFLICT DO NOTHING""",
+                                (
+                                    conflict_id,
+                                    concept["id"],
+                                    ev_a["document_id"],
+                                    ev_b["document_id"],
+                                    f"概念「{concept['name']}」在两篇文档中的表述可能存在差异",
+                                    snippet_a[:500],
+                                    snippet_b[:500],
+                                ),
+                            )
+                            conflicts_found.append({
+                                "concept_id": str(concept["id"]),
+                                "concept_name": concept["name"],
+                                "doc_a": {"id": str(ev_a["document_id"]), "title": ev_a["document_title"]},
+                                "doc_b": {"id": str(ev_b["document_id"]), "title": ev_b["document_title"]},
+                                "evidence_a": snippet_a[:200],
+                                "evidence_b": snippet_b[:200],
+                                "overlap_score": round(overlap, 3),
+                            })
+
+                            if len(conflicts_found) >= max_pairs:
+                                break
+                    if len(conflicts_found) >= max_pairs:
+                        break
+                if len(conflicts_found) >= max_pairs:
+                    break
+
+            self.conn.commit()
+
+        self.log_operation(
+            operation_type="conflict_detect",
+            entity_type="system",
+            details={"conflicts_found": len(conflicts_found)},
+            operator="api",
+        )
+
+        logger.info(f"矛盾检测完成：发现 {len(conflicts_found)} 个潜在矛盾")
+        return conflicts_found
+
+    def get_conflicts(self, resolved: bool = False, limit: int = 30) -> list[dict]:
+        """获取矛盾列表"""
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT cf.*, c.name AS concept_name,
+                          d1.title AS doc_a_title, d2.title AS doc_b_title
+                FROM concept_conflicts cf
+                LEFT JOIN concepts c ON cf.concept_id = c.id
+                LEFT JOIN documents d1 ON cf.doc_a_id = d1.id
+                LEFT JOIN documents d2 ON cf.doc_b_id = d2.id
+                WHERE cf.resolved = %s
+                ORDER BY cf.created_at DESC LIMIT %s""",
+                (resolved, limit),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": str(r["id"]),
+                    "concept_id": str(r["concept_id"]) if r["concept_id"] else None,
+                    "concept_name": r["concept_name"],
+                    "doc_a": {"id": str(r["doc_a_id"]), "title": r["doc_a_title"]},
+                    "doc_b": {"id": str(r["doc_b_id"]), "title": r["doc_b_title"]},
+                    "conflict_type": r["conflict_type"],
+                    "description": r["description"],
+                    "evidence_a": r["evidence_a"],
+                    "evidence_b": r["evidence_b"],
+                    "severity": r["severity"],
+                    "resolved": r["resolved"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                }
+                for r in rows
+            ]
+
+    def generate_knowledge_landscape(self, domain: str = None) -> dict:
+        """
+        跨文献知识图景报告（信息升维）。
+
+        借鉴 NotebookLM+Codex 的"信息升维"设计：
+        - 在单文档摘要之上做跨文档综合
+        - 6 个模块的知识全景分析
+        """
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. 知识地图：概念分布与集群
+            domain_filter = "WHERE d.domain = %s" if domain else ""
+            params = [domain] if domain else []
+
+            cur.execute(
+                f"""SELECT c.id, c.name, c.category, c.doc_count,
+                    COUNT(dc2.concept_id) AS related_count
+                FROM concepts c
+                JOIN document_concepts dc ON c.id = dc.concept_id
+                JOIN documents d ON dc.document_id = d.id {domain_filter}
+                LEFT JOIN document_concepts dc2 ON dc2.document_id = dc.document_id AND dc2.concept_id != c.id
+                WHERE c.doc_count >= 1
+                GROUP BY c.id, c.name, c.category, c.doc_count
+                ORDER BY c.doc_count DESC
+                LIMIT 50""",
+                params,
+            )
+            concept_map = cur.fetchall()
+
+            # 2. 核心概念集群（doc_count >= 3）
+            core_clusters = [
+                {"name": r["name"], "category": r["category"], "doc_count": r["doc_count"],
+                 "related_concepts": r["related_count"]}
+                for r in concept_map if r["doc_count"] >= 3
+            ]
+
+            # 3. 知识空白：仅有 1 篇文档支撑的概念
+            knowledge_gaps = [
+                {"name": r["name"], "category": r["category"]}
+                for r in concept_map if r["doc_count"] == 1
+            ]
+
+            # 4. 学科分布
+            cur.execute(
+                f"""SELECT d.domain, d.doc_type, COUNT(*) AS cnt
+                FROM documents d
+                WHERE d.status = 'ready'
+                {'AND d.domain = %s' if domain else ''}
+                GROUP BY d.domain, d.doc_type
+                ORDER BY cnt DESC""",
+                params,
+            )
+            distribution = cur.fetchall()
+
+            # 5. 概念共现网络（top pairs）
+            cur.execute(
+                f"""SELECT c1.name AS concept_a, c2.name AS concept_b,
+                    COUNT(DISTINCT dc1.document_id) AS co_occurrence
+                FROM document_concepts dc1
+                JOIN document_concepts dc2 ON dc1.document_id = dc2.document_id AND dc1.concept_id < dc2.concept_id
+                JOIN concepts c1 ON dc1.concept_id = c1.id
+                JOIN concepts c2 ON dc2.concept_id = c2.id
+                JOIN documents d ON dc1.document_id = d.id {domain_filter}
+                WHERE d.status = 'ready'
+                GROUP BY c1.name, c2.name
+                ORDER BY co_occurrence DESC LIMIT 20""",
+                params,
+            )
+            co_occurrences = cur.fetchall()
+
+            # 6. 趋势分析：按年统计文档和概念增长
+            cur.execute(
+                f"""SELECT
+                    COALESCE(EXTRACT(YEAR FROM d.published_at)::INT, EXTRACT(YEAR FROM d.created_at)::INT) AS year,
+                    COUNT(DISTINCT d.id) AS docs,
+                    COUNT(DISTINCT dc.concept_id) AS concepts
+                FROM documents d
+                LEFT JOIN document_concepts dc ON d.id = dc.document_id
+                WHERE d.status = 'ready'
+                {'AND d.domain = %s' if domain else ''}
+                GROUP BY 1 ORDER BY year DESC LIMIT 10""",
+                params,
+            )
+            trends = cur.fetchall()
+
+        landscape = {
+            "generated_at": datetime.now().isoformat(),
+            "domain_filter": domain,
+            "summary": {
+                "total_concepts": len(concept_map),
+                "core_clusters": len(core_clusters),
+                "knowledge_gaps": len(knowledge_gaps),
+                "co_occurrence_pairs": len(co_occurrences),
+            },
+            "knowledge_map": {
+                "core_clusters": core_clusters[:15],
+                "concept_distribution": {
+                    r["category"]: r["doc_count"] for r in concept_map[:30]
+                },
+            },
+            "knowledge_gaps": knowledge_gaps[:20],
+            "discipline_distribution": [
+                {"domain": r["domain"], "doc_type": r["doc_type"], "count": r["cnt"]}
+                for r in distribution
+            ],
+            "concept_co_occurrences": [
+                {"concept_a": r["concept_a"], "concept_b": r["concept_b"],
+                 "co_occurrence": r["co_occurrence"]}
+                for r in co_occurrences
+            ],
+            "growth_trends": [
+                {"year": int(r["year"]) if r["year"] else None,
+                 "docs": r["docs"], "concepts": r["concepts"]}
+                for r in trends
+            ],
+            "insights": [],
+        }
+
+        # 自动生成洞察
+        if core_clusters:
+            top_concept = core_clusters[0]
+            landscape["insights"].append(
+                f"核心知识集群围绕「{top_concept['name']}」展开，覆盖 {top_concept['doc_count']} 篇文档"
+            )
+        if knowledge_gaps:
+            landscape["insights"].append(
+                f"发现 {len(knowledge_gaps)} 个知识空白点（仅 1 篇文档支撑），建议补充相关文献"
+            )
+        if co_occurrences:
+            top_pair = co_occurrences[0]
+            landscape["insights"].append(
+                f"最强概念关联：「{top_pair['concept_a']}」与「{top_pair['concept_b']}」共现 {top_pair['co_occurrence']} 次"
+            )
+
+        self.log_operation(
+            operation_type="landscape",
+            entity_type="system",
+            details={"domain": domain, "concepts_mapped": len(concept_map)},
+            operator="api",
+        )
+
+        return landscape
+
+    # ============================================================
+    # P3: 对话记忆 + 多视角概念
+    # ============================================================
+
+    def record_query(
+        self,
+        session_id: str,
+        query_text: str,
+        query_type: str = "search",
+        result_count: int = 0,
+        result_doc_ids: list = None,
+        operator: str = "mcp",
+    ) -> str:
+        """记录查询历史（对话记忆）"""
+        query_id = str(uuid.uuid4())
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO query_history
+                (id, session_id, query_text, query_type, result_count, result_doc_ids)
+                VALUES (%s, %s, %s, %s, %s, %s)""",
+                (
+                    query_id,
+                    session_id,
+                    query_text,
+                    query_type,
+                    result_count,
+                    result_doc_ids or [],
+                ),
+            )
+            self.conn.commit()
+        return query_id
+
+    def get_session_context(self, session_id: str, limit: int = 10) -> dict:
+        """
+        获取会话上下文（hot.md 等效）。
+
+        返回该会话的查询历史 + 上下文摘要，
+        供 AI 在后续查询时参考"之前聊过什么"。
+        """
+        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, query_text, query_type, result_count, result_doc_ids,
+                          created_at, context_summary
+                FROM query_history
+                WHERE session_id = %s
+                ORDER BY created_at DESC LIMIT %s""",
+                (session_id, limit),
+            )
+            rows = cur.fetchall()
+
+            if not rows:
+                return {"session_id": session_id, "queries": [], "context_summary": ""}
+
+            queries = [
+                {
+                    "query": r["query_text"],
+                    "type": r["query_type"],
+                    "result_count": r["result_count"],
+                    "result_doc_ids": [str(d) for d in r["result_doc_ids"]] if r["result_doc_ids"] else [],
+                    "timestamp": r["created_at"].isoformat() if r["created_at"] else None,
+                }
+                for r in rows
+            ]
+
+            # 生成上下文摘要（纯规则版）
+            topics = list(set(q["query"] for q in queries[:5]))
+            context_summary = f"本会话已讨论 {len(rows)} 个问题，主要涉及：{', '.join(topics[:5])}"
+
+            return {
+                "session_id": session_id,
+                "query_count": len(rows),
+                "queries": queries,
+                "context_summary": context_summary,
+            }
+
+    def extract_concepts_multiperspective(self, doc_id: str, perspectives: list = None) -> dict:
+        """
+        同源异构多视角概念提取。
+
+        对同一文档从不同视角（如法学/社会学/经济学）提取概念，
+        每个视角的概念标记 perspective 字段。
+
+        借鉴 claude-obsidian 的"同源异构"设计：
+        同一来源材料，不同视角的解读会产生不同的概念网络。
+        """
+        if perspectives is None:
+            # 默认视角
+            perspectives = ["legal", "social", "technical"]
+
+        perspective_keywords = {
+            "legal": ["法", "权", "义务", "责任", "规制", "合规", "法律", "条款", "立法", "司法"],
+            "social": ["社会", "文化", "群体", "影响", "变迁", "结构", "关系", "行为", "观念"],
+            "technical": ["技术", "算法", "数据", "模型", "系统", "架构", "实现", "方法", "工具"],
+            "economic": ["经济", "市场", "成本", "效益", "产业", "商业模式", "竞争", "价格"],
+            "ethical": ["伦理", "道德", "公平", "正义", "权利", "尊严", "自由", "善"],
+        }
+
+        all_results = {}
+
+        for perspective in perspectives:
+            keywords = perspective_keywords.get(perspective, [])
+            if not keywords:
+                continue
+
+            # 获取文档内容
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT content FROM documents WHERE id = %s", (doc_id,))
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    continue
+                content = row[0][:8000]
+
+            # 使用 jieba 提取关键词，然后按视角过滤
+            try:
+                import jieba.analyse
+                all_keywords = jieba.analyse.extract_tags(content, topK=30, withWeight=True)
+                # 过滤出属于当前视角的关键词
+                perspective_concepts = [
+                    (word, weight) for word, weight in all_keywords
+                    if any(kw in word for kw in keywords) and len(word) >= 2
+                ][:10]
+
+                if not perspective_concepts:
+                    all_results[perspective] = []
+                    continue
+
+                # 存入 document_concepts 表，标记 perspective
+                for word, weight in perspective_concepts:
+                    normalized = self._normalize_concept(word)
+                    category = self._classify_concept(word)
+
+                    # 查找或创建概念
+                    cur.execute("SELECT id FROM concepts WHERE normalized = %s", (normalized,))
+                    existing = cur.fetchone()
+                    if existing:
+                        concept_id = existing[0]
+                        cur.execute(
+                            "UPDATE concepts SET doc_count = doc_count + 1 WHERE id = %s",
+                            (concept_id,),
+                        )
+                    else:
+                        concept_id = str(uuid.uuid4())
+                        cur.execute(
+                            """INSERT INTO concepts (id, name, normalized, category, doc_count)
+                            VALUES (%s, %s, %s, %s, 1)""",
+                            (concept_id, word, normalized, category),
+                        )
+
+                    # 建立 perspective 关联
+                    cur.execute(
+                        """INSERT INTO document_concepts (document_id, concept_id, relevance, perspective)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (document_id, concept_id) DO UPDATE
+                        SET relevance = EXCLUDED.relevance, perspective = EXCLUDED.perspective""",
+                        (doc_id, concept_id, round(float(weight) * 10, 4), perspective),
+                    )
+
+                all_results[perspective] = [
+                    {"name": w, "relevance": round(float(wt), 4)}
+                    for w, wt in perspective_concepts
+                ]
+
+            except ImportError:
+                logger.warning("jieba 未安装，多视角提取不可用")
+                all_results[perspective] = []
+
+        self.conn.commit()
+
+        self.log_operation(
+            operation_type="extract_concepts",
+            entity_type="document",
+            entity_id=doc_id,
+            details={"perspectives": perspectives, "total": sum(len(v) for v in all_results.values())},
+            operator="api",
+        )
+
+        return {
+            "doc_id": doc_id,
+            "perspectives": all_results,
+            "total_concepts": sum(len(v) for v in all_results.values()),
+        }
